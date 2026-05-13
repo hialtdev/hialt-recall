@@ -41,7 +41,7 @@ def _load_settings() -> Settings:
         raise SystemExit("Missing MONGO_URI in .env")
 
     # This assumes your repos are in a 'data/repos' folder relative to the script
-    repo_root = Path(__file__).resolve().parents[1]
+    repo_root = Path(__file__).resolve().parents[0]
     data_repos_dir = (repo_root / "data" / "repos").resolve()
 
     return Settings(
@@ -66,6 +66,11 @@ def _is_markdown(path: Path) -> bool:
 def _is_code(path: Path) -> bool:
     return path.suffix.lower() in {".py", ".rs", ".js", ".ts", ".java", ".go", ".toml", ".yaml"}
 
+EXCLUDED_DIRS = {
+    "node_modules", ".git", "target", "build", "dist",
+    ".next", "__pycache__", ".venv", "venv", "coverage"
+}
+
 def _iter_source_files(repos_dir: Path, max_files: Optional[int] = None) -> Iterator[Tuple[str, Path]]:
     if not repos_dir.exists():
         print(f"Warning: {repos_dir} not found. Creating it...")
@@ -76,6 +81,8 @@ def _iter_source_files(repos_dir: Path, max_files: Optional[int] = None) -> Iter
     for project_dir in sorted(repos_dir.iterdir()):
         if not project_dir.is_dir(): continue
         for path in sorted(project_dir.rglob("*")):
+            if any(part in EXCLUDED_DIRS for part in path.parts):
+                continue
             if path.is_file() and not path.name.startswith(".") and (_is_markdown(path) or _is_code(path)):
                 yield project_dir.name, path
                 count += 1
@@ -115,18 +122,46 @@ def _chunk_markdown(text: str) -> List[Tuple[str, str]]:
     escaped = _escape_header_hashes_in_fenced_code(text)
     splitter = MarkdownHeaderTextSplitter(headers_to_split_on=HEADER_LEVELS, strip_headers=False)
     docs = splitter.split_text(escaped)
-    return [(doc.page_content, "Header Path Placeholder") for doc in docs]
+    
+    raw_chunks = []
+    for doc in docs:
+        parts = [doc.metadata.get(k, "") for _, k in HEADER_LEVELS if doc.metadata.get(k)]
+        headers = " > ".join(parts) if parts else "Top"
+        raw_chunks.append((doc.page_content.strip(), headers))
+
+    capped = []
+    max_chars = 400
+    for chunk_text, headers in raw_chunks:
+        if len(chunk_text) <= max_chars:
+            capped.append((chunk_text, headers))
+        else:
+            for i in range(0, len(chunk_text), max_chars):
+                sub = chunk_text[i:i + max_chars].strip()
+                if sub:
+                    capped.append((sub, headers))
+    return capped
 
 def _chunk_code(text: str) -> List[Tuple[str, str]]:
-    return [(text.strip(), "Code")] if text.strip() else []
+    cleaned = text.strip()
+    if not cleaned:
+        return []
+    max_chars = 400
+    chunks = []
+    for i in range(0, len(cleaned), max_chars):
+        chunk = cleaned[i:i + max_chars].strip()
+        if chunk:
+            chunks.append((chunk, "Code"))
+    return chunks
 
 def _sha256_hex(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8", errors="ignore")).hexdigest()
 
 def _ollama_embeddings(settings: Settings, text: str) -> List[float]:
     url = f"{settings.ollama_base_url.rstrip('/')}/api/embeddings"
-    resp = requests.post(url, json={"model": settings.embedding_model, "prompt": text}, timeout=120)
-    resp.raise_for_status()
+    resp = requests.post(url, json={"model": settings.embedding_model, "prompt": text}, timeout=120)    
+    if resp.status_code != 200:
+        print(f"Ollama error body: {resp.text}")
+        resp.raise_for_status()
     return resp.json().get("embedding", [])
 
 def _make_doc_id(project: str, source_file_rel: str, chunk_index: int, headers: str, text: str) -> str:
@@ -149,9 +184,10 @@ def main() -> None:
         print("Collection reset.")
 
     ops = []
+  
     files_iter = _iter_source_files(settings.data_repos_dir, args.max_files)
     for project, file_path in tqdm(files_iter, desc="Ingesting"):
-        rel_path = file_path.resolve().relative_to(settings.data_repos_dir).as_posix()
+        rel_path = file_path.relative_to(settings.data_repos_dir).as_posix()
         raw_text = _read_text_file(file_path)
 
         chunks = _chunk_markdown(raw_text) if _is_markdown(file_path) else _chunk_code(raw_text)
@@ -160,7 +196,11 @@ def main() -> None:
             doc_id = _make_doc_id(project, rel_path, idx, h_path, content)
             if collection.find_one({"_id": doc_id}): continue
 
-            emb = _ollama_embeddings(settings, content)
+            try:
+                emb = _ollama_embeddings(settings, content)
+            except Exception as e:
+                print(f"\nFailed embedding chunk: {e}")
+                continue
             doc = {
                 "_id": doc_id, "project": project, "source_file": rel_path,
                 "headers": h_path, "text": content, settings.embedding_field: emb

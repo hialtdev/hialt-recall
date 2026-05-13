@@ -28,7 +28,6 @@ class Chunk(TypedDict):
     score: float
 
 def _load_settings() -> Settings:
-    # Look for .env in the same directory as the script
     this_dir = os.path.dirname(os.path.abspath(__file__))
     load_dotenv(dotenv_path=os.path.join(this_dir, ".env"), override=False)
 
@@ -139,13 +138,18 @@ def main() -> None:
     context_parts = [f"[{i+1}] {r['source_file']} ({r['headers']}):\n{r['text']}" for i, r in enumerate(results)]
     user_prompt = f"Context:\n{chr(10).join(context_parts)}\n\nQuestion: {args.query}"
 
-    print("🤖 Generating answer...")
+    print("🚀 Generating answer via Groq (Turbo)...")
     try:
-        answer = _ollama_chat(settings, _build_system_prompt(), user_prompt)
-    except Exception:
-        if args.no_groq: raise
-        print("Ollama failed, falling back to Groq...")
+        # Groq is now the primary engine
         answer = _groq_chat(settings, _build_system_prompt(), user_prompt)
+    except Exception as e:
+        if args.no_groq:
+            print(f"❌ Groq failed and --no-groq is set: {e}")
+            return
+        
+        print(f"⚠️ Groq failed ({e}). Falling back to local Ollama (CPU will spike)...")
+        # Ollama is now the backup
+        answer = _ollama_chat(settings, _build_system_prompt(), user_prompt)
 
     print(f"\n--- ANSWER ---\n{answer}")
 
