@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: hialt-recall-config
+  namespace: default
+data:
+  MONGO_URI: "mongodb://mongoadmin:mymongoloco@mongodb-svc.default.svc.cluster.local:27017/local_rag?authSource=admin"
+  OLLAMA_BASE_URL: "http://ollama-svc.default.svc.cluster.local:11434"
+  OLLAMA_EMBEDDING_MODEL: "mxbai-embed-large"
+  MONGO_COLLECTION: "rag_chunks"
+  MONGO_EMBEDDING_FIELD: "embedding"
+  OLLAMA_LLM_MODEL: "llama3"
+  LLM_TEMPERATURE: "0.2"
+  GROQ_MODEL: "llama-3.3-70b-versatile"

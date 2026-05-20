@@ -1,0 +1,32 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hialt-recall
+  namespace: default
+  labels:
+    app: hialt-recall
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: hialt-recall
+  template:
+    metadata:
+      labels:
+        app: hialt-recall
+    spec:
+      containers:
+      - name: hialt-recall-ui
+        image: hialtdev/hialt-recall:latest
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 8501
+        envFrom:
+        - configMapRef:
+            name: hialt-recall-config
+        env:
+        - name: GROQ_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: groq-secret
+              key: api-key

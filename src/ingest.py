@@ -1,3 +1,4 @@
+from rag_engine import _load_settings, Settings
 import argparse
 import hashlib
 import os
@@ -32,27 +33,7 @@ class Settings:
     embedding_field: str
     data_repos_dir: Path
 
-def _load_settings() -> Settings:
-    this_dir = Path(__file__).resolve().parent
-    load_dotenv(dotenv_path=this_dir / ".env", override=False)
 
-    mongo_uri = os.environ.get("MONGO_URI", "").strip()
-    if not mongo_uri:
-        raise SystemExit("Missing MONGO_URI in .env")
-
-    # This assumes your repos are in a 'data/repos' folder relative to the script
-    repo_root = Path(__file__).resolve().parents[0]
-    data_repos_dir = (repo_root / "data" / "repos").resolve()
-
-    return Settings(
-        mongo_uri=mongo_uri,
-        ollama_base_url=os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434").strip(),
-        mongo_default_db=os.environ.get("MONGO_DB_NAME", "local_rag"),
-        mongo_collection=os.environ.get("MONGO_COLLECTION", "rag_chunks").strip(),
-        embedding_model=os.environ.get("OLLAMA_EMBEDDING_MODEL", "mxbai-embed-large").strip(),
-        embedding_field=os.environ.get("MONGO_EMBEDDING_FIELD", "embedding").strip(),
-        data_repos_dir=data_repos_dir,
-    )
 
 def _read_text_file(path: Path) -> str:
     try:

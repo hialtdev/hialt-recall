@@ -1,10 +1,14 @@
+# hialt-recall requirements
+# Original deps
 pymongo>=4.7.0
 requests>=2.31.0
 python-dotenv>=1.0.1
 tqdm>=4.66.0
 numpy>=1.26.0
 
-# Text chunking
+# Text chunking (used by ingest.py)
 langchain-text-splitters>=0.3.0
 langchain-core>=0.3.0
 
+# Streamlit UI (new)
+streamlit>=1.35.0
