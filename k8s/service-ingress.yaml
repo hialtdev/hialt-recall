@@ -1,0 +1,32 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: hialt-recall-svc
+  namespace: hialt-recall
+spec:
+  type: ClusterIP
+  selector:
+    app: hialt-recall-ui
+  ports:
+    - port: 8501
+      targetPort: 8501
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: hialt-recall-ingress
+  namespace: hialt-recall
+  annotations:
+    kubernetes.io/ingress.class: traefik
+spec:
+  rules:
+    - host: recall.hialt.dev
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: hialt-recall-svc
+                port:
+                  number: 8501

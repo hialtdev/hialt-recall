@@ -39,6 +39,7 @@ class Settings:
     groq_api_key: Optional[str]
     groq_model: str
     llm_temperature: float
+    data_repos_dir: Path  # Added so ingest.py can find your projects
 
 
 def load_settings(env_path: Optional[str] = None) -> Settings:
@@ -50,13 +51,9 @@ def load_settings(env_path: Optional[str] = None) -> Settings:
     if env_path:
         load_dotenv(dotenv_path=env_path, override=True)
     else:
-        # This file is at ~/hialt-recall/src/rag_engine.py
         this_dir = Path(__file__).resolve().parent
-        # Climb up one directory to the repository root (~/hialt-recall/.env)
         root_dir = this_dir.parent
-        
         dotenv_path = root_dir / ".env"
-        # Fallback to current directory just in case
         if not dotenv_path.exists():
             dotenv_path = this_dir / ".env"
             
@@ -64,11 +61,14 @@ def load_settings(env_path: Optional[str] = None) -> Settings:
 
     mongo_uri = os.environ.get("MONGO_URI", "").strip()
     if not mongo_uri:
-        # Providing explicit feedback to the Streamlit UI if it fails
-        raise RuntimeError(
-            f"Missing MONGO_URI in .env or environment.\n"
-            f"Attempted to read from: {dotenv_path.resolve()}"
-        )
+        raise RuntimeError(f"Missing MONGO_URI in .env or environment. Checked: {dotenv_path}")
+
+    # Dynamically locate data/repos directory based on environment
+    if os.environ.get("KUBERNETES_SERVICE_HOST"):
+        data_repos_dir = Path("/data/repos").resolve()
+    else:
+        this_dir = Path(__file__).resolve().parent
+        data_repos_dir = (this_dir.parent / "data" / "repos").resolve()
 
     return Settings(
         mongo_uri=mongo_uri,
@@ -81,8 +81,8 @@ def load_settings(env_path: Optional[str] = None) -> Settings:
         groq_api_key=os.environ.get("GROQ_API_KEY") or None,
         groq_model=os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile").strip(),
         llm_temperature=float(os.environ.get("LLM_TEMPERATURE", "0.2").strip()),
+        data_repos_dir=data_repos_dir,  # Passed back here
     )
-
 
 # ---------------------------------------------------------------------------
 # Data types

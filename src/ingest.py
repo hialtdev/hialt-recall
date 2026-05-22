@@ -1,18 +1,23 @@
-from rag_engine import _load_settings, Settings
 import argparse
 import hashlib
-import os
 import re
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator, List, Optional, Tuple
 
-import requests
+import json
+from confluent_kafka import Producer
 from dotenv import load_dotenv
 from langchain_core.documents import Document
 from langchain_text_splitters import MarkdownHeaderTextSplitter
-from pymongo import MongoClient, UpdateOne
+from pymongo import MongoClient
 from tqdm import tqdm
+
+from rag_engine import load_settings, Settings
+
+# Load environment variables early for local development fallback
+load_dotenv()
 
 HEADER_LEVELS = [
     ("#", "h1"),
@@ -22,18 +27,6 @@ HEADER_LEVELS = [
 
 _ESC_PREFIX = "__RAG_ESC_HASH_"
 _ESC_SUFFIX = "__"
-
-@dataclass(frozen=True)
-class Settings:
-    mongo_uri: str
-    ollama_base_url: str
-    mongo_default_db: str
-    mongo_collection: str
-    embedding_model: str
-    embedding_field: str
-    data_repos_dir: Path
-
-
 
 def _read_text_file(path: Path) -> str:
     try:
@@ -49,7 +42,9 @@ def _is_code(path: Path) -> bool:
 
 EXCLUDED_DIRS = {
     "node_modules", ".git", "target", "build", "dist",
-    ".next", "__pycache__", ".venv", "venv", "coverage"
+    ".next", "__pycache__", ".venv", "venv", "coverage",
+    ".storage", ".cloud", "tts", "backups", "share", "custom_components",
+    "hialt-recall/data"
 }
 
 def _iter_source_files(repos_dir: Path, max_files: Optional[int] = None) -> Iterator[Tuple[str, Path]]:
@@ -97,7 +92,7 @@ def _escape_header_hashes_in_fenced_code(markdown: str) -> str:
     return "".join(out_lines)
 
 def _unescape_header_hash_tokens_in_fenced_code(text: str) -> str:
-    return text.replace(_ESC_PREFIX, "#" * 1).replace(_ESC_SUFFIX, "") # Simplified for this pass
+    return text.replace(_ESC_PREFIX, "#" * 1).replace(_ESC_SUFFIX, "")
 
 def _chunk_markdown(text: str) -> List[Tuple[str, str]]:
     escaped = _escape_header_hashes_in_fenced_code(text)
@@ -137,37 +132,38 @@ def _chunk_code(text: str) -> List[Tuple[str, str]]:
 def _sha256_hex(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8", errors="ignore")).hexdigest()
 
-def _ollama_embeddings(settings: Settings, text: str) -> List[float]:
-    url = f"{settings.ollama_base_url.rstrip('/')}/api/embeddings"
-    resp = requests.post(url, json={"model": settings.embedding_model, "prompt": text}, timeout=120)    
-    if resp.status_code != 200:
-        print(f"Ollama error body: {resp.text}")
-        resp.raise_for_status()
-    return resp.json().get("embedding", [])
-
 def _make_doc_id(project: str, source_file_rel: str, chunk_index: int, headers: str, text: str) -> str:
     key = f"{project}|{source_file_rel}|{chunk_index}|{headers}|{_sha256_hex(text)}"
     return _sha256_hex(key)
 
+def kafka_delivery_report(err, msg):
+    if err is not None:
+        print(f"Kafka Delivery Failure: {err}")
+
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Ingest local repos into MongoDB.")
+    parser = argparse.ArgumentParser(description="Ingest local repos via Kafka.")
     parser.add_argument("--reset", action="store_true")
     parser.add_argument("--max-files", type=int, default=None)
     args = parser.parse_args()
 
-    settings = _load_settings()
-    client = MongoClient(settings.mongo_uri)
-    db = client[settings.mongo_default_db]
-    collection = db[settings.mongo_collection]
+    settings = load_settings()
 
     if args.reset:
+        client = MongoClient(settings.mongo_uri)
+        db = client[settings.mongo_default_db]
+        collection = db[settings.mongo_collection]
         collection.drop()
-        print("Collection reset.")
+        print("MongoDB collection dropped for reset.")
+        client.close()
 
-    ops = []
-  
+    # Dynamic bootstrap target for port-forward vs in-cluster deployment
+    bootstrap_servers = os.environ.get('KAFKA_BOOTSTRAP_SERVERS', 'localhost:9092')
+    producer = Producer({'bootstrap.servers': bootstrap_servers})
+    print(f"Kafka Producer initialized targeting broker: {bootstrap_servers}. Scanning dependencies...")
+
     files_iter = _iter_source_files(settings.data_repos_dir, args.max_files)
-    for project, file_path in tqdm(files_iter, desc="Ingesting"):
+    
+    for project, file_path in tqdm(files_iter, desc="Publishing to Kafka"):
         rel_path = file_path.relative_to(settings.data_repos_dir).as_posix()
         raw_text = _read_text_file(file_path)
 
@@ -175,23 +171,27 @@ def main() -> None:
 
         for idx, (content, h_path) in enumerate(chunks):
             doc_id = _make_doc_id(project, rel_path, idx, h_path, content)
-            if collection.find_one({"_id": doc_id}): continue
-
-            try:
-                emb = _ollama_embeddings(settings, content)
-            except Exception as e:
-                print(f"\nFailed embedding chunk: {e}")
-                continue
-            doc = {
-                "_id": doc_id, "project": project, "source_file": rel_path,
-                "headers": h_path, "text": content, settings.embedding_field: emb
+            
+            payload = {
+                "doc_id": doc_id,
+                "project": project,
+                "source_file": rel_path,
+                "chunk_index": idx,  # Explicitly included for clear upsert handling
+                "headers": h_path,
+                "text": content
             }
-            ops.append(UpdateOne({"_id": doc_id}, {"$set": doc}, upsert=True))
-            if len(ops) >= 50:
-                collection.bulk_write(ops)
-                ops = []
-    if ops: collection.bulk_write(ops)
-    print("Done!")
+
+            producer.produce(
+                topic=os.environ.get('KAFKA_TOPIC', 'hialt-recall-chunks'),
+                key=doc_id.encode('utf-8'),
+                value=json.dumps(payload).encode('utf-8'),
+                callback=kafka_delivery_report
+            )
+            producer.poll(0)
+
+    print("\nFlushing remaining messages to Kafka broker...")
+    producer.flush()
+    print("Pipeline production complete! All files published to Kafka.")
 
 if __name__ == "__main__":
     main()

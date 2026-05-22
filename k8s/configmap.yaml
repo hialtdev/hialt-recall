@@ -2,13 +2,21 @@ apiVersion: v1
 kind: ConfigMap
 metadata:
   name: hialt-recall-config
-  namespace: default
+  namespace: hialt-recall
 data:
-  MONGO_URI: "mongodb://mongoadmin:mymongoloco@mongodb-svc.default.svc.cluster.local:27017/local_rag?authSource=admin"
-  OLLAMA_BASE_URL: "http://ollama-svc.default.svc.cluster.local:11434"
-  OLLAMA_EMBEDDING_MODEL: "mxbai-embed-large"
-  MONGO_COLLECTION: "rag_chunks"
-  MONGO_EMBEDDING_FIELD: "embedding"
-  OLLAMA_LLM_MODEL: "llama3"
-  LLM_TEMPERATURE: "0.2"
-  GROQ_MODEL: "llama-3.3-70b-versatile"
+  # ── Kafka ─────────────────────────────────────────────────────────────────
+  KAFKA_BOOTSTRAP_SERVERS: "bitbybit-kafka-kafka-bootstrap.kafka.svc.cluster.local:9092"
+  KAFKA_TOPIC:             "hialt-recall-chunks"
+  KAFKA_CONSUMER_GROUP:    "hialt-recall-workers"
+  # ── Ollama (in-cluster) ───────────────────────────────────────────────────
+  OLLAMA_BASE_URL:         "http://ollama-service.hialt-recall.svc.cluster.local:11434"
+  OLLAMA_EMBEDDING_MODEL:  "mxbai-embed-large"
+  OLLAMA_LLM_MODEL:        "llama3"
+  # ── MongoDB ───────────────────────────────────────────────────────────────
+  MONGO_URI:               "mongodb://mongoadmin:mymongoloco@mongodb-service.default.svc.cluster.local:27017/local_rag?authSource=admin"
+  MONGO_DB_NAME:           "local_rag"
+  MONGO_COLLECTION:        "rag_chunks"
+  MONGO_EMBEDDING_FIELD:   "embedding"
+  # ── LLM ───────────────────────────────────────────────────────────────────
+  LLM_TEMPERATURE:         "0.2"
+  GROQ_MODEL:              "llama-3.3-70b-versatile"

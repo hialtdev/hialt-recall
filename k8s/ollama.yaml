@@ -1,0 +1,107 @@
+# ── Persistent Volume ────────────────────────────────────────────────────────
+# Points at the existing system Ollama model store so no re-download is needed.
+# hostPath PVs are node-scoped; fine for a single-node k3s cluster.
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: ollama-models-pv
+spec:
+  capacity:
+    storage: 20Gi
+  accessModes:
+    - ReadWriteOnce
+  persistentVolumeReclaimPolicy: Retain   # keep models if PVC is deleted
+  hostPath:
+    path: /usr/share/ollama/.ollama/models
+    type: Directory
+---
+# ── Persistent Volume Claim ───────────────────────────────────────────────────
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ollama-models-pvc
+  namespace: hialt-recall
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 20Gi
+  volumeName: ollama-models-pv   # bind directly to the PV above
+---
+# ── Deployment ────────────────────────────────────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ollama
+  namespace: hialt-recall
+  labels:
+    app: ollama
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ollama
+  template:
+    metadata:
+      labels:
+        app: ollama
+    spec:
+      # Run as the ollama system user (uid 1000 on most installs) so the
+      # pod can read the hostPath model files owned by the ollama user.
+      # Adjust uid/gid if `id ollama` returns different values on your host.
+      securityContext:
+        runAsUser: 997
+        runAsGroup: 986
+        fsGroup: 986
+      containers:
+        - name: ollama
+          image: ollama/ollama:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 11434
+          env:
+            - name: OLLAMA_MODELS
+              value: /models   # tells Ollama where to look inside the container
+          volumeMounts:
+            - name: models
+              mountPath: /models
+          resources:
+            requests:
+              memory: "4Gi"
+              cpu: "1000m"
+            limits:
+              memory: "12Gi"   # headroom for llama3 + embed model simultaneously
+              cpu: "4000m"
+          readinessProbe:
+            httpGet:
+              path: /api/tags
+              port: 11434
+            initialDelaySeconds: 20
+            periodSeconds: 10
+            failureThreshold: 6
+          livenessProbe:
+            httpGet:
+              path: /api/tags
+              port: 11434
+            initialDelaySeconds: 40
+            periodSeconds: 20
+            failureThreshold: 3
+      volumes:
+        - name: models
+          persistentVolumeClaim:
+            claimName: ollama-models-pvc
+---
+# ── Service ───────────────────────────────────────────────────────────────────
+apiVersion: v1
+kind: Service
+metadata:
+  name: ollama-service
+  namespace: hialt-recall
+spec:
+  type: ClusterIP
+  selector:
+    app: ollama
+  ports:
+    - port: 11434
+      targetPort: 11434

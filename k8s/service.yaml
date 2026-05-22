@@ -2,7 +2,7 @@ apiVersion: v1
 kind: Service
 metadata:
   name: hialt-recall-svc
-  namespace: default
+  namespace: hialt-recall
 spec:
   type: ClusterIP
   ports:

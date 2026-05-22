@@ -1,0 +1,13 @@
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaTopic
+metadata:
+  name: hialt-recall-chunks
+  namespace: kafka # Must match your Strimzi cluster namespace
+  labels:
+    strimzi.io/cluster: bitbybit-kafka # Must match your Strimzi Kafka cluster name
+spec:
+  partitions: 3
+  replicas: 1
+  config:
+    retention.ms: 604800000 # 7 days
+    segment.bytes: 1073741824

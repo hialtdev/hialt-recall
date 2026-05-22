@@ -1,32 +1,83 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: hialt-recall
-  namespace: default
+  name: hialt-recall-ui
+  namespace: hialt-recall
   labels:
-    app: hialt-recall
+    app: hialt-recall-ui
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: hialt-recall
+      app: hialt-recall-ui
   template:
     metadata:
       labels:
-        app: hialt-recall
+        app: hialt-recall-ui
     spec:
+      imagePullSecrets:
+        - name: ghcr-secret
       containers:
-      - name: hialt-recall-ui
-        image: hialtdev/hialt-recall:latest
-        imagePullPolicy: Always
-        ports:
-        - containerPort: 8501
-        envFrom:
-        - configMapRef:
-            name: hialt-recall-config
-        env:
-        - name: GROQ_API_KEY
-          valueFrom:
-            secretKeyRef:
-              name: groq-secret
-              key: api-key
+        - name: ui
+          image: ghcr.io/hialtdev/hialt-recall:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8501
+          envFrom:
+            - configMapRef:
+                name: hialt-recall-config
+          env:
+            - name: GROQ_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: groq-secret
+                  key: api-key
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8501
+            initialDelaySeconds: 20
+            periodSeconds: 10
+            failureThreshold: 6
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "250m"
+            limits:
+              memory: "512Mi"
+              cpu: "500m"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hialt-recall-consumer
+  namespace: hialt-recall
+  labels:
+    app: hialt-recall-consumer
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: hialt-recall-consumer
+  template:
+    metadata:
+      labels:
+        app: hialt-recall-consumer
+    spec:
+      imagePullSecrets:
+        - name: ghcr-secret
+      containers:
+        - name: consumer
+          image: ghcr.io/hialtdev/hialt-recall:latest
+          imagePullPolicy: Always
+          command: ["python", "src/rag_consumer.py"]
+          envFrom:
+            - configMapRef:
+                name: hialt-recall-config
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "250m"
+            limits:
+              memory: "512Mi"
+              cpu: "500m"

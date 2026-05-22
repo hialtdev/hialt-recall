@@ -12,3 +12,5 @@ langchain-core>=0.3.0
 
 # Streamlit UI (new)
 streamlit>=1.35.0
+# Kafka pipeline
+confluent-kafka>=2.3.0
