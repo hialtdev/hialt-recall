@@ -1,5 +1,5 @@
 FROM python:3.11-slim
-
+LABEL org.opencontainers.image.source="https://github.com/hialtdev/hialt-recall"
 WORKDIR /app
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
