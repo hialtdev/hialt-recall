@@ -208,7 +208,34 @@ footer { display: none !important; }
 """, unsafe_allow_html=True)
 
 # ── Imports after page config ───────────────────────────────────────────────
+from pymongo import MongoClient
+
 from rag_engine import load_settings, run_query, Settings, RAGResult
+
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
+
+@st.cache_data(ttl=60, show_spinner=False)
+def _fetch_filter_options(mongo_uri: str, db_name: str, collection: str) -> tuple[list[str], list[str]]:
+    """
+    Return (projects, tags) as sorted lists of distinct values present in MongoDB.
+    Cached for 60 s so the sidebar doesn't hit Mongo on every keystroke.
+    Falls back to empty lists on any connection error.
+    """
+    try:
+        client = MongoClient(mongo_uri, serverSelectionTimeoutMS=2000)
+        coll   = client[db_name][collection]
+        projects: list[str] = sorted(
+            v for v in coll.distinct("metadata.project") if v
+        )
+        raw_tags: list[list] = coll.distinct("metadata.tags")
+        # distinct on an array field returns the individual array elements
+        tags: list[str] = sorted({str(t) for t in raw_tags if t})
+        client.close()
+        return projects, tags
+    except Exception:  # noqa: BLE001
+        return [], []
+
 
 
 # ── Session state ────────────────────────────────────────────────────────────
@@ -240,8 +267,51 @@ with st.sidebar:
         help="Mirrors the --no-groq CLI flag. Useful when you're offline or want to avoid Groq.",
     )
 
-    st.markdown('<div class="sidebar-section">Environment</div>', unsafe_allow_html=True)
+    # ── Metadata filters ─────────────────────────────────────────────────────
+    st.markdown('<div class="sidebar-section">Filters</div>', unsafe_allow_html=True)
+
     cfg = st.session_state.settings
+    projects: list[str] = []
+    tags:     list[str] = []
+
+    if cfg:
+        projects, tags = _fetch_filter_options(
+            cfg.mongo_uri, cfg.mongo_default_db, cfg.mongo_collection
+        )
+
+    project_options = ["— all projects —"] + projects
+    selected_project = st.selectbox(
+        "Project",
+        options=project_options,
+        index=0,
+        help="Restrict retrieval to chunks from a single project. "
+             "Only projects with indexed documents appear here.",
+    )
+    project_filter: str | None = None if selected_project == "— all projects —" else selected_project
+
+    tag_options = ["— all tags —"] + tags
+    selected_tag = st.selectbox(
+        "Tag",
+        options=tag_options,
+        index=0,
+        help="Restrict retrieval to chunks whose metadata.tags contains this tag.",
+    )
+    tag_filter: str | None = None if selected_tag == "— all tags —" else selected_tag
+
+    if projects or tags:
+        st.markdown(
+            f'<div style="font-family:var(--mono);font-size:0.68rem;color:var(--muted);">'
+            f'{len(projects)} project(s) · {len(tags)} tag(s) indexed</div>',
+            unsafe_allow_html=True,
+        )
+    else:
+        st.markdown(
+            '<div style="font-family:var(--mono);font-size:0.68rem;color:var(--muted);">'
+            'No metadata indexed yet — run ingest.py first.</div>',
+            unsafe_allow_html=True,
+        )
+
+    st.markdown('<div class="sidebar-section">Environment</div>', unsafe_allow_html=True)
     if cfg:
         st.markdown(f"""
 <div style="font-family: var(--mono); font-size: 0.72rem; color: var(--muted); line-height: 1.9;">
@@ -293,10 +363,16 @@ col_btn, col_hint = st.columns([1, 4])
 with col_btn:
     submit = st.button("→ Ask", use_container_width=True)
 with col_hint:
+    filter_hint = ""
+    if project_filter:
+        filter_hint += f" · project={project_filter}"
+    if tag_filter:
+        filter_hint += f" · tag={tag_filter}"
     st.markdown(
         f'<div style="font-family:var(--mono);font-size:0.72rem;color:var(--muted);padding-top:10px;">'
         f'top-k={top_k} &nbsp;·&nbsp; '
         f'{"ollama only" if force_ollama else "groq → ollama fallback"}'
+        f'{filter_hint}'
         f'</div>',
         unsafe_allow_html=True,
     )
@@ -314,6 +390,8 @@ if submit:
             top_k=top_k,
             force_ollama=force_ollama,
             settings=st.session_state.settings,
+            project_filter=project_filter,
+            tag_filter=tag_filter,
         )
 
     st.session_state.history.append(result)

@@ -1,12 +1,14 @@
 import argparse
 import hashlib
+import logging
 import re
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterator, List, Optional, Tuple
 
 import json
+import yaml
 from confluent_kafka import Producer
 from dotenv import load_dotenv
 from langchain_core.documents import Document
@@ -18,6 +20,15 @@ from rag_engine import load_settings, Settings
 
 # Load environment variables early for local development fallback
 load_dotenv()
+
+log = logging.getLogger("hialt.ingest")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
+    datefmt="%Y-%m-%dT%H:%M:%S",
+)
+
+MANIFEST_FILENAME = "hialt-knowledge.yaml"
 
 HEADER_LEVELS = [
     ("#", "h1"),
@@ -40,29 +51,230 @@ def _is_markdown(path: Path) -> bool:
 def _is_code(path: Path) -> bool:
     return path.suffix.lower() in {".py", ".rs", ".js", ".ts", ".java", ".go", ".toml", ".yaml"}
 
-EXCLUDED_DIRS = {
+
+# ---------------------------------------------------------------------------
+# Global exclusion defaults — applied when no manifest is present AND as an
+# always-on safety net even when a manifest exists (manifest can only ADD to
+# these, not remove them, so vendor noise never leaks in accidentally).
+# ---------------------------------------------------------------------------
+
+EXCLUDED_DIRS: frozenset[str] = frozenset({
     "node_modules", ".git", "target", "build", "dist",
     ".next", "__pycache__", ".venv", "venv", "coverage",
     ".storage", ".cloud", "tts", "backups", "share", "custom_components",
-    "hialt-recall/data"
-}
+    "hialt-recall/data",
+    # Additional safe-defaults not in the original set:
+    "vendor", "third_party", ".terraform", ".idea", ".vscode",
+    ".mypy_cache", ".ruff_cache", ".pytest_cache", ".tox",
+})
 
-def _iter_source_files(repos_dir: Path, max_files: Optional[int] = None) -> Iterator[Tuple[str, Path]]:
+
+# ---------------------------------------------------------------------------
+# Manifest dataclass
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class IngestionManifest:
+    """Parsed, validated representation of hialt-knowledge.yaml."""
+
+    project_name: str
+    project_tags: list[str] = field(default_factory=list)
+    enabled: bool = True
+    # Normalised (no leading/trailing slash) relative paths to prune
+    exclude_paths: frozenset[str] = field(default_factory=frozenset)
+    # Empty == allow all extensions that pass _is_markdown/_is_code checks
+    include_extensions: frozenset[str] = field(default_factory=frozenset)
+
+    @classmethod
+    def from_dict(cls, data: dict, fallback_name: str) -> "IngestionManifest":
+        project  = data.get("project",   {}) or {}
+        ingestion = data.get("ingestion", {}) or {}
+
+        raw_excludes: list[str] = ingestion.get("exclude_paths", [])       or []
+        raw_exts:     list[str] = ingestion.get("include_extensions", [])  or []
+
+        return cls(
+            project_name=str(project.get("name", fallback_name)).strip(),
+            project_tags=[str(t).strip() for t in (project.get("tags") or [])],
+            enabled=bool(ingestion.get("enabled", True)),
+            exclude_paths=frozenset(
+                _normalise_path(p) for p in raw_excludes if p
+            ),
+            include_extensions=frozenset(
+                (e if e.startswith(".") else f".{e}").lower()
+                for e in raw_exts if e
+            ),
+        )
+
+    @classmethod
+    def default(cls, project_name: str) -> "IngestionManifest":
+        return cls(project_name=project_name)
+
+
+# ---------------------------------------------------------------------------
+# Path helpers
+# ---------------------------------------------------------------------------
+
+def _normalise_path(raw: str) -> str:
+    """Strip leading/trailing slashes and whitespace for safe prefix matching."""
+    return raw.strip().strip("/").strip("\\")
+
+
+
+# ---------------------------------------------------------------------------
+# Manifest loading
+# ---------------------------------------------------------------------------
+
+def _load_manifest(project_root: Path) -> IngestionManifest:
+    """
+    Parse hialt-knowledge.yaml at the root of *project_root* if it exists.
+    Falls back to IngestionManifest.default() on any error so that one bad
+    manifest never blocks the rest of the pipeline.
+    """
+    manifest_path = project_root / MANIFEST_FILENAME
+    fallback_name = project_root.name
+
+    if not manifest_path.is_file():
+        log.debug("No manifest in %s — using defaults.", project_root.name)
+        return IngestionManifest.default(fallback_name)
+
+    try:
+        with manifest_path.open("r", encoding="utf-8") as fh:
+            raw = yaml.safe_load(fh)
+        if not isinstance(raw, dict):
+            raise ValueError("Manifest root must be a YAML mapping.")
+        manifest = IngestionManifest.from_dict(raw, fallback_name)
+        log.info(
+            "Manifest loaded: project='%s' tags=%s enabled=%s "
+            "exclude_paths=%d include_extensions=%d",
+            manifest.project_name, manifest.project_tags, manifest.enabled,
+            len(manifest.exclude_paths), len(manifest.include_extensions),
+        )
+        return manifest
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "Bad manifest at %s: %s — falling back to defaults.", manifest_path, exc
+        )
+        return IngestionManifest.default(fallback_name)
+
+
+# ---------------------------------------------------------------------------
+# Directory exclusion check
+# ---------------------------------------------------------------------------
+
+def _is_excluded_dir(dir_name: str, rel_dir: str, manifest: IngestionManifest) -> bool:
+    """
+    Return True if a directory should be pruned from the os.walk descent.
+
+    Checks (in priority order):
+      1. Global EXCLUDED_DIRS — leaf name match (always applied).
+      2. Manifest exclude_paths — supports both leaf names ("vendor") and
+         relative sub-paths ("docs/generated") via prefix matching.
+    """
+    # 1. Global safety net — leaf name only
+    if dir_name in EXCLUDED_DIRS:
+        return True
+
+    # 2. Manifest-specified paths
+    candidate = _normalise_path(os.path.join(rel_dir, dir_name))
+    for excluded in manifest.exclude_paths:
+        if candidate == excluded or candidate.startswith(excluded + "/"):
+            return True
+
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Extension filter
+# ---------------------------------------------------------------------------
+
+def _is_allowed_file(path: Path, manifest: IngestionManifest) -> bool:
+    """
+    Return True when a file should be ingested.
+
+    If the manifest specifies include_extensions, ONLY those extensions are
+    allowed (full allow-list mode).  Otherwise, fall back to the original
+    _is_markdown / _is_code predicate so existing behaviour is unchanged.
+    """
+    if manifest.include_extensions:
+        return path.suffix.lower() in manifest.include_extensions
+    # Original behaviour: markdown or recognised code extensions
+    return _is_markdown(path) or _is_code(path)
+
+
+# ---------------------------------------------------------------------------
+# Manifest-driven directory walker (replaces _iter_source_files)
+# ---------------------------------------------------------------------------
+
+def _iter_source_files(
+    repos_dir: Path,
+    max_files: Optional[int] = None,
+) -> Iterator[Tuple[str, Path, IngestionManifest]]:
+    """
+    Iterate valid source files under *repos_dir*, one project at a time.
+
+    Yields ``(project_dir_name, absolute_file_path, manifest)`` so that
+    callers have full access to the parsed manifest (project name, tags, …)
+    when building Kafka payloads.
+
+    Key behavioural guarantees:
+    - Each top-level subdirectory of *repos_dir* is treated as a project.
+    - hialt-knowledge.yaml is loaded (or defaulted) once per project.
+    - ``ingestion.enabled: false`` skips the entire project tree.
+    - ``dirs[:]`` is mutated in-place inside os.walk so excluded subtrees
+      (e.g. node_modules with 40 000 files) are never stat()'d at all.
+    - The original ``project_dir.name`` is always yielded as the identifier
+      so that ``_make_doc_id`` hashing remains stable across runs even if
+      the manifest renames the project for display purposes.
+    """
     if not repos_dir.exists():
-        print(f"Warning: {repos_dir} not found. Creating it...")
+        log.warning("%s not found — creating it.", repos_dir)
         repos_dir.mkdir(parents=True, exist_ok=True)
         return
 
     count = 0
+    repos_dir_str = str(repos_dir)
+
     for project_dir in sorted(repos_dir.iterdir()):
-        if not project_dir.is_dir(): continue
-        for path in sorted(project_dir.rglob("*")):
-            if any(part in EXCLUDED_DIRS for part in path.parts):
-                continue
-            if path.is_file() and not path.name.startswith(".") and (_is_markdown(path) or _is_code(path)):
-                yield project_dir.name, path
+        if not project_dir.is_dir():
+            continue
+
+        manifest = _load_manifest(project_dir)
+
+        if not manifest.enabled:
+            log.info("Project '%s' disabled via manifest — skipping.", manifest.project_name)
+            continue
+
+        project_root_str = str(project_dir)
+
+        for dirpath, dirs, files in os.walk(project_root_str, topdown=True):
+            # Relative path of the directory currently being walked
+            rel_dir = os.path.relpath(dirpath, project_root_str)
+            rel_dir = "" if rel_dir == "." else rel_dir
+
+            # ── Prune dirs in-place ────────────────────────────────────────
+            # Mutating dirs[:] with topdown=True stops os.walk from ever
+            # entering excluded subtrees — critical for vendor/node_modules.
+            dirs[:] = sorted(
+                d for d in dirs
+                if not d.startswith(".")          # skip hidden dirs always
+                and not _is_excluded_dir(d, rel_dir, manifest)
+            )
+
+            for filename in sorted(files):
+                if filename.startswith("."):
+                    continue
+
+                file_path = Path(dirpath) / filename
+
+                if not _is_allowed_file(file_path, manifest):
+                    continue
+
+                yield project_dir.name, file_path, manifest
                 count += 1
-                if max_files and count >= max_files: return
+                if max_files and count >= max_files:
+                    return
+
 
 def _escape_header_hashes_in_fenced_code(markdown: str) -> str:
     fence_re = re.compile(r"^\s*(```+|~~~+)")
@@ -144,6 +356,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Ingest local repos via Kafka.")
     parser.add_argument("--reset", action="store_true")
     parser.add_argument("--max-files", type=int, default=None)
+    parser.add_argument(
+        "--project",
+        default=None,
+        help="Only ingest this project directory name (optional filter).",
+    )
     args = parser.parse_args()
 
     settings = load_settings()
@@ -162,8 +379,13 @@ def main() -> None:
     print(f"Kafka Producer initialized targeting broker: {bootstrap_servers}. Scanning dependencies...")
 
     files_iter = _iter_source_files(settings.data_repos_dir, args.max_files)
-    
-    for project, file_path in tqdm(files_iter, desc="Publishing to Kafka"):
+
+    # _iter_source_files now yields (project_dir_name, path, manifest)
+    for project, file_path, manifest in tqdm(files_iter, desc="Publishing to Kafka"):
+        # Optional single-project filter (mirrors --project CLI arg)
+        if args.project and project != args.project:
+            continue
+
         rel_path = file_path.relative_to(settings.data_repos_dir).as_posix()
         raw_text = _read_text_file(file_path)
 
@@ -171,14 +393,23 @@ def main() -> None:
 
         for idx, (content, h_path) in enumerate(chunks):
             doc_id = _make_doc_id(project, rel_path, idx, h_path, content)
-            
+
             payload = {
                 "doc_id": doc_id,
-                "project": project,
+                "project": project,                 # kept at top level for backwards compat
                 "source_file": rel_path,
-                "chunk_index": idx,  # Explicitly included for clear upsert handling
+                "chunk_index": idx,
                 "headers": h_path,
-                "text": content
+                "text": content,
+                # ── Rich metadata block ────────────────────────────────────
+                # Nested under "metadata" so the retrieval layer can query:
+                #   {"metadata.project": ...}  and  {"metadata.tags": ...}
+                # Top-level "project" field is preserved so existing consumers
+                # don't break during the migration window.
+                "metadata": {
+                    "project": manifest.project_name,
+                    "tags":    manifest.project_tags,
+                },
             }
 
             producer.produce(

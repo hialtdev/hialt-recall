@@ -33,6 +33,10 @@ def main() -> None:
                         help="Number of chunks to retrieve (default: 3).")
     parser.add_argument("--no-groq", action="store_true",
                         help="Disable Groq, force local Ollama only.")
+    parser.add_argument("--project", default=None,
+                        help="Restrict retrieval to this project name.")
+    parser.add_argument("--tag", default=None,
+                        help="Restrict retrieval to chunks with this tag.")
     args = parser.parse_args()
 
     try:
@@ -55,6 +59,8 @@ def main() -> None:
         top_k=args.top_k,
         force_ollama=args.no_groq,
         settings=settings,
+        project_filter=args.project,
+        tag_filter=args.tag,
     )
 
     # Surface fallback / error notes

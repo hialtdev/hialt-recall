@@ -30,8 +30,13 @@ spec:
             - name: GROQ_API_KEY
               valueFrom:
                 secretKeyRef:
-                  name: groq-secret
-                  key: api-key
+                  name: hialt-recall-secrets
+                  key: groq-api-key
+            - name: MONGO_URI
+              valueFrom:
+                secretKeyRef:
+                  name: hialt-recall-secrets
+                  key: mongodb-uri
           readinessProbe:
             httpGet:
               path: /healthz
@@ -74,6 +79,12 @@ spec:
           envFrom:
             - configMapRef:
                 name: hialt-recall-config
+          env:
+            - name: MONGO_URI
+              valueFrom:
+                secretKeyRef:
+                  name: hialt-recall-secrets
+                  key: mongodb-uri
           resources:
             requests:
               memory: "256Mi"

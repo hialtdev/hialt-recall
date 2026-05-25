@@ -1,6 +1,4 @@
-# ── Persistent Volume ────────────────────────────────────────────────────────
-# Points at the existing system Ollama model store so no re-download is needed.
-# hostPath PVs are node-scoped; fine for a single-node k3s cluster.
+# ── Persistent Volume (model weights) ────────────────────────────────────────
 apiVersion: v1
 kind: PersistentVolume
 metadata:
@@ -10,7 +8,8 @@ spec:
     storage: 20Gi
   accessModes:
     - ReadWriteOnce
-  persistentVolumeReclaimPolicy: Retain   # keep models if PVC is deleted
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: ""
   hostPath:
     path: /usr/share/ollama/.ollama/models
     type: Directory
@@ -24,10 +23,11 @@ metadata:
 spec:
   accessModes:
     - ReadWriteOnce
+  storageClassName: ""
+  volumeName: ollama-models-pv
   resources:
     requests:
       storage: 20Gi
-  volumeName: ollama-models-pv   # bind directly to the PV above
 ---
 # ── Deployment ────────────────────────────────────────────────────────────────
 apiVersion: apps/v1
@@ -47,9 +47,6 @@ spec:
       labels:
         app: ollama
     spec:
-      # Run as the ollama system user (uid 1000 on most installs) so the
-      # pod can read the hostPath model files owned by the ollama user.
-      # Adjust uid/gid if `id ollama` returns different values on your host.
       securityContext:
         runAsUser: 997
         runAsGroup: 986
@@ -61,17 +58,21 @@ spec:
           ports:
             - containerPort: 11434
           env:
-            - name: OLLAMA_MODELS
-              value: /models   # tells Ollama where to look inside the container
+            - name: OLLAMA_HOME    # writable dir for keys/config
+              value: /home/ollama
+            - name: OLLAMA_MODELS  # read-only model weights
+              value: /models
           volumeMounts:
-            - name: models
+            - name: ollama-home    # writable home for keys/config
+              mountPath: /home/ollama
+            - name: models         # model weights from host
               mountPath: /models
           resources:
             requests:
               memory: "4Gi"
-              cpu: "1000m"
+              cpu: "200m"
             limits:
-              memory: "12Gi"   # headroom for llama3 + embed model simultaneously
+              memory: "12Gi"
               cpu: "4000m"
           readinessProbe:
             httpGet:
@@ -88,6 +89,10 @@ spec:
             periodSeconds: 20
             failureThreshold: 3
       volumes:
+        - name: ollama-home        # backed by host dir owned by uid 997
+          hostPath:
+            path: /var/lib/ollama-k8s
+            type: Directory
         - name: models
           persistentVolumeClaim:
             claimName: ollama-models-pvc

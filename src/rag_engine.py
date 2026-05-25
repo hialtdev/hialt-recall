@@ -19,7 +19,6 @@ from typing import List, Optional, TypedDict
 
 import numpy as np
 import requests
-from dotenv import load_dotenv
 from pymongo import MongoClient
 
 
@@ -93,6 +92,8 @@ class Chunk(TypedDict):
     source_file: str
     headers: str
     score: float
+    # Populated when the document carries a metadata block (manifest-ingested)
+    metadata: dict          # {"project": str, "tags": list[str]}
 
 
 @dataclass
@@ -130,7 +131,7 @@ def _cosine_top_k(
     embedding_field: str,
     top_k: int,
 ) -> List[Chunk]:
-    """Exact port of _cosine_top_k() from query.py."""
+    """Exact port of _cosine_top_k() from query.py, extended to carry metadata."""
     q = np.array(query_vec, dtype=np.float32)
     q_norm = np.linalg.norm(q)
     if q_norm == 0:
@@ -153,6 +154,14 @@ def _cosine_top_k(
                 source_file=doc.get("source_file", ""),
                 headers=doc.get("headers", ""),
                 score=score,
+                # Forward the nested metadata block written by ingest.py.
+                # Falls back to a dict built from the legacy flat "project"
+                # field so that documents ingested before this upgrade still
+                # surface meaningful metadata in the UI.
+                metadata=doc.get("metadata") or {
+                    "project": doc.get("project", ""),
+                    "tags":    [],
+                },
             )
         )
 
@@ -160,20 +169,92 @@ def _cosine_top_k(
     return scored[:top_k]
 
 
-def fetch_and_rank(settings: Settings, query_vec: List[float], top_k: int) -> List[Chunk]:
-    """Fetch all docs from Mongo and return top-k by cosine similarity."""
+def fetch_and_rank(
+    settings: Settings,
+    query_vec: List[float],
+    top_k: int,
+    project_filter: Optional[str] = None,
+    tag_filter: Optional[str] = None,
+) -> List[Chunk]:
+    """
+    Fetch candidate documents from MongoDB, apply optional metadata filters,
+    then return the top-k chunks ranked by exact cosine similarity.
+
+    Parameters
+    ──────────
+    settings
+        Shared pipeline configuration (Mongo URI, collection, embedding field).
+    query_vec
+        Embedding of the user's query; must match the dimensionality of stored
+        vectors (produced by ``embed_query()``).
+    top_k
+        Maximum number of ranked Chunk results to return.
+    project_filter : optional
+        If provided, restricts the MongoDB query to documents where
+        ``metadata.project`` exactly equals this string.  Falls back to the
+        legacy top-level ``project`` field via ``$or`` so that documents
+        ingested before the manifest upgrade are still reachable.
+    tag_filter : optional
+        If provided, restricts the MongoDB query to documents where
+        ``metadata.tags`` contains this tag (``$in`` semantics on the array).
+
+    Returns
+    ───────
+    List[Chunk] — ranked highest-score-first, length ≤ top_k.
+    Empty list when no candidates match the filter or no embeddings are stored.
+    """
     client = MongoClient(settings.mongo_uri, serverSelectionTimeoutMS=5000)
-    db = client[settings.mongo_default_db]
+    db     = client[settings.mongo_default_db]
     collection = db[settings.mongo_collection]
+
+    # ── Build the metadata filter dynamically ─────────────────────────────
+    #
+    # Documents written by the updated ingest.py carry:
+    #   { "project": "dir-name",               # legacy flat field (kept)
+    #     "metadata": { "project": "Display Name", "tags": [...] } }
+    #
+    # To stay backwards-compatible with documents ingested before the manifest
+    # upgrade, project_filter matches EITHER location via $or.
+    # tag_filter targets only the new metadata.tags array.
+
+    filter_clauses: list[dict] = []
+
+    if project_filter is not None:
+        filter_clauses.append({
+            "$or": [
+                {"metadata.project": project_filter},
+                {"project":          project_filter},   # legacy flat field
+            ]
+        })
+
+    if tag_filter is not None:
+        # $in on an array field returns any doc whose tags list contains the value.
+        filter_clauses.append({"metadata.tags": {"$in": [tag_filter]}})
+
+    match filter_clauses:
+        case []:
+            mongo_filter: dict = {}
+        case [single]:
+            mongo_filter = single
+        case multiple:
+            mongo_filter = {"$and": multiple}
+
+    # ── Projection ────────────────────────────────────────────────────────
+    # Fetch exactly the fields _cosine_top_k + callers need.
+    # The embedding vector is included for scoring and stripped by _cosine_top_k
+    # before results are returned so it never leaks into the UI or prompt.
     projection = {
-        "_id": 0,
-        "text": 1,
-        "source_file": 1,
-        "headers": 1,
+        "_id":              0,
+        "text":             1,
+        "source_file":      1,
+        "headers":          1,
+        "metadata":         1,
+        "project":          1,   # legacy field — for backwards-compat fallback in _cosine_top_k
         settings.embedding_field: 1,
     }
-    all_docs = list(collection.find({}, projection))
-    return _cosine_top_k(query_vec, all_docs, settings.embedding_field, top_k)
+
+    all_docs = list(collection.find(mongo_filter, projection))
+    return _cosine_top_k(all_docs, query_vec, settings.embedding_field, top_k)
 
 
 # ---------------------------------------------------------------------------
@@ -242,15 +323,19 @@ def run_query(
     top_k: int = 3,
     force_ollama: bool = False,
     settings: Optional[Settings] = None,
+    project_filter: Optional[str] = None,
+    tag_filter: Optional[str] = None,
 ) -> RAGResult:
     """
     Full RAG pipeline: embed → retrieve → generate.
 
     Args:
-        question:     Natural-language question.
-        top_k:        Number of chunks to retrieve (default 3).
-        force_ollama: Skip Groq, use Ollama only (mirrors --no-groq flag).
-        settings:     Pre-loaded Settings; loads from .env if None.
+        question:        Natural-language question.
+        top_k:           Number of chunks to retrieve (default 3).
+        force_ollama:    Skip Groq, use Ollama only (mirrors --no-groq flag).
+        settings:        Pre-loaded Settings; loads from .env if None.
+        project_filter:  If set, restrict retrieval to this project name.
+        tag_filter:      If set, restrict retrieval to docs with this tag.
 
     Returns:
         RAGResult — always returns, never raises.
@@ -275,9 +360,15 @@ def run_query(
             error=f"Embedding failed: {e}",
         )
 
-    # Step 2 — retrieve
+    # Step 2 — retrieve (with optional metadata filters)
     try:
-        chunks = fetch_and_rank(settings, q_vec, top_k)
+        chunks = fetch_and_rank(
+            settings,
+            q_vec,
+            top_k,
+            project_filter=project_filter,
+            tag_filter=tag_filter,
+        )
     except Exception as e:
         return RAGResult(
             question=question, answer="", chunks=[], llm_used="none",
