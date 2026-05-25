@@ -254,7 +254,7 @@ def fetch_and_rank(
     }
 
     all_docs = list(collection.find(mongo_filter, projection))
-    return _cosine_top_k(all_docs, query_vec, settings.embedding_field, top_k)
+    return _cosine_top_k(query_vec, all_docs, settings.embedding_field, top_k)
 
 
 # ---------------------------------------------------------------------------
