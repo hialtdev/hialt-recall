@@ -58,6 +58,8 @@ spec:
           ports:
             - containerPort: 11434
           env:
+            - name: HOME
+              value: /home/ollama
             - name: OLLAMA_HOME    # writable dir for keys/config
               value: /home/ollama
             - name: OLLAMA_MODELS  # read-only model weights

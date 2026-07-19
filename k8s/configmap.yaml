@@ -6,16 +6,16 @@ metadata:
 data:
   # ── Kafka ─────────────────────────────────────────────────────────────────
   KAFKA_BOOTSTRAP_SERVERS: "bitbybit-kafka-kafka-bootstrap.kafka.svc.cluster.local:9092"
-  KAFKA_TOPIC:             "hialt-recall-chunks"
-  KAFKA_CONSUMER_GROUP:    "hialt-recall-workers"
+  KAFKA_TOPIC: "hialt-recall-chunks"
+  KAFKA_CONSUMER_GROUP: "hialt-recall-workers"
   # ── Ollama (in-cluster) ───────────────────────────────────────────────────
-  OLLAMA_BASE_URL:         "http://ollama-service.hialt-recall.svc.cluster.local:11434"
-  OLLAMA_EMBEDDING_MODEL:  "mxbai-embed-large"
-  OLLAMA_LLM_MODEL:        "llama3"
+  OLLAMA_BASE_URL: "http://ollama-service.hialt-recall.svc.cluster.local:11434"
+  OLLAMA_EMBEDDING_MODEL: "mxbai-embed-large"
+  OLLAMA_LLM_MODEL: "llama3"
   # ── MongoDB Configuration ──────────────────────────────────────────────────
-  MONGO_DB_NAME:           "local_rag"
-  MONGO_COLLECTION:        "rag_chunks"
-  MONGO_EMBEDDING_FIELD:   "embedding"
+  MONGO_DB_NAME: "local_rag"
+  MONGO_COLLECTION: "rag_chunks"
+  MONGO_EMBEDDING_FIELD: "embedding"
   # ── LLM ───────────────────────────────────────────────────────────────────
-  LLM_TEMPERATURE:         "0.2"
-  GROQ_MODEL:              "llama-3.3-70b-versatile"
+  LLM_TEMPERATURE: "0.2"
+  GROQ_MODEL: "openai/gpt-oss-120b"

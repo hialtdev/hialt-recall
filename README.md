@@ -82,7 +82,7 @@ OLLAMA_LLM_MODEL=llama3
 
 # Groq (primary LLM — fast, free tier, open source models)
 GROQ_API_KEY=gsk_your_key_here
-GROQ_MODEL=llama-3.3-70b-versatile
+GROQ_MODEL=openai/gpt-oss-120b
 
 # MongoDB collection
 MONGO_DB_NAME=local_rag
