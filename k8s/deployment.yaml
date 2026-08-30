@@ -39,11 +39,21 @@ spec:
                   key: mongodb-uri
           readinessProbe:
             httpGet:
-              path: /healthz
+              # Streamlit's built-in health endpoint. There is no bare
+              # /healthz route (that was 404ing, so this pod likely never
+              # reported Ready and never received Service/Ingress traffic).
+              path: /_stcore/health
               port: 8501
             initialDelaySeconds: 20
             periodSeconds: 10
             failureThreshold: 6
+          livenessProbe:
+            httpGet:
+              path: /_stcore/health
+              port: 8501
+            initialDelaySeconds: 40
+            periodSeconds: 20
+            failureThreshold: 3
           resources:
             requests:
               memory: "256Mi"

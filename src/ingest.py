@@ -3,6 +3,7 @@ import hashlib
 import logging
 import re
 import os
+import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterator, List, Optional, Tuple
@@ -62,7 +63,6 @@ EXCLUDED_DIRS: frozenset[str] = frozenset({
     "node_modules", ".git", "target", "build", "dist",
     ".next", "__pycache__", ".venv", "venv", "coverage",
     ".storage", ".cloud", "tts", "backups", "share", "custom_components",
-    "hialt-recall/data",
     # Additional safe-defaults not in the original set:
     "vendor", "third_party", ".terraform", ".idea", ".vscode",
     ".mypy_cache", ".ruff_cache", ".pytest_cache", ".tox",
@@ -185,6 +185,128 @@ def _is_excluded_dir(dir_name: str, rel_dir: str, manifest: IngestionManifest) -
 
 
 # ---------------------------------------------------------------------------
+# Secret-file safety net
+# ---------------------------------------------------------------------------
+#
+# Unlike EXCLUDED_DIRS (which a manifest can't remove from, but which only
+# guards against noise), this guards against a chunk's text ending up in
+# Mongo AND being shipped to a third-party LLM (Groq) as RAG context on any
+# query that happens to retrieve it. A careless or wrong manifest must never
+# be able to override this — false positives (a legitimate file skipped) are
+# a much cheaper mistake than a leaked credential, so this errs broad.
+#
+# This is a filename heuristic, not a content scanner: it won't catch a
+# secret value inlined inside an otherwise-innocuous-looking file (e.g. a
+# real password hardcoded in a deployment manifest instead of referenced via
+# secretKeyRef). Review what you're ingesting from a new project regardless.
+
+_SECRET_NAME_RE = re.compile(
+    r"(^|[^a-z0-9])(secret|secrets|credential|credentials)([^a-z0-9]|$)",
+    re.IGNORECASE,
+)
+_SECRET_KEY_FILE_EXTENSIONS = frozenset({".pem", ".key", ".pfx", ".p12", ".jks", ".keystore"})
+_SECRET_EXACT_NAMES = frozenset({
+    "id_rsa", "id_ed25519", "id_ecdsa", "id_dsa", ".npmrc", ".pypirc", ".netrc",
+})
+
+
+def _looks_like_secret(path: Path) -> bool:
+    """True if this filename suggests it holds credentials, not documentation/code."""
+    name = path.name.lower()
+    stem = path.stem.lower()
+    suffix = path.suffix.lower()
+
+    if name == ".env" or (name.startswith(".env.") and not name.endswith(".example")):
+        return True
+    if name in _SECRET_EXACT_NAMES:
+        return True
+    if suffix in _SECRET_KEY_FILE_EXTENSIONS:
+        return True
+    if _SECRET_NAME_RE.search(stem):
+        return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# .gitignore safety net
+# ---------------------------------------------------------------------------
+#
+# A project's own .gitignore is the clearest "don't share this" signal a
+# developer can give — and it's what actually caught the real Seq-password
+# leak (KubeConfigs/k8s/seq/secret.yaml was already gitignored; ingest.py
+# just wasn't consulting it). Respecting it here catches everything the
+# filename heuristic above can't: local overrides, scratch notes, anything
+# credential-shaped that doesn't happen to have "secret" in its name.
+#
+# Delegates to `git status --ignored` rather than hand-parsing .gitignore
+# files: git already correctly resolves nested .gitignore files in
+# subdirectories, `!negation` patterns, and repo-local excludes in
+# .git/info/exclude that are never even committed. Reimplementing that
+# matching logic by hand is easy to get subtly wrong.
+#
+# Deliberately checks "ignored", not "untracked" — a brand-new file that
+# hasn't been `git add`ed yet is untracked but NOT ignored, and should
+# still be ingested. Only files git would refuse to track are excluded.
+#
+# Same manifest-proof-floor philosophy as _looks_like_secret(): a project
+# can't opt back into ingesting its own gitignored files via the manifest.
+# If something genuinely needs to be ingested, the fix is to un-ignore it
+# in the project's own .gitignore, not to punch a hole in this net.
+
+def _load_gitignored_paths(project_root: Path) -> frozenset[str]:
+    """
+    Return the set of paths (POSIX-style, relative to project_root) that
+    `git` considers ignored for this project.
+
+    Returns an empty set — never raises — if project_root isn't a git repo,
+    git isn't installed, or the command fails for any reason. One project's
+    git trouble should never block ingestion of everything else, same as a
+    bad hialt-knowledge.yaml manifest falling back to defaults.
+    """
+    if not (project_root / ".git").exists():
+        return frozenset()
+
+    try:
+        result = subprocess.run(
+            ["git", "status", "--ignored=matching", "--porcelain=v1", "-z"],
+            cwd=str(project_root),
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+        if result.returncode != 0:
+            log.warning(
+                "`git status --ignored` failed for %s (exit %d) — proceeding "
+                "without gitignore-based filtering for this project.",
+                project_root.name, result.returncode,
+            )
+            return frozenset()
+
+        ignored: set[str] = set()
+        for entry in result.stdout.decode("utf-8", errors="ignore").split("\0"):
+            # Porcelain v1: ignored entries are prefixed "!! " followed by the path.
+            if entry.startswith("!! "):
+                ignored.add(entry[3:])
+        return frozenset(ignored)
+
+    except (OSError, subprocess.SubprocessError) as exc:
+        log.warning(
+            "Could not determine gitignored paths for %s (%s) — proceeding "
+            "without gitignore-based filtering for this project.",
+            project_root.name, exc,
+        )
+        return frozenset()
+
+
+def _is_gitignored(file_path: Path, project_root: Path, gitignored: frozenset[str]) -> bool:
+    """True if file_path is in this project's precomputed gitignored-paths set."""
+    if not gitignored:
+        return False
+    rel = file_path.relative_to(project_root).as_posix()
+    return rel in gitignored
+
+
+# ---------------------------------------------------------------------------
 # Extension filter
 # ---------------------------------------------------------------------------
 
@@ -195,7 +317,16 @@ def _is_allowed_file(path: Path, manifest: IngestionManifest) -> bool:
     If the manifest specifies include_extensions, ONLY those extensions are
     allowed (full allow-list mode).  Otherwise, fall back to the original
     _is_markdown / _is_code predicate so existing behaviour is unchanged.
+
+    _looks_like_secret() is checked first and is NOT overridable by a
+    manifest's include_extensions — see its docstring for why.
     """
+    if _looks_like_secret(path):
+        log.warning(
+            "Skipping likely-secret file (safety net, not manifest-configurable): %s",
+            path,
+        )
+        return False
     if manifest.include_extensions:
         return path.suffix.lower() in manifest.include_extensions
     # Original behaviour: markdown or recognised code extensions
@@ -226,6 +357,10 @@ def _iter_source_files(
     - The original ``project_dir.name`` is always yielded as the identifier
       so that ``_make_doc_id`` hashing remains stable across runs even if
       the manifest renames the project for display purposes.
+    - Anything the project's own ``git status --ignored`` considers ignored
+      is skipped (computed once per project) — see the ".gitignore safety
+      net" section above for why. Not manifest-configurable, same as
+      ``_looks_like_secret()``.
     """
     if not repos_dir.exists():
         log.warning("%s not found — creating it.", repos_dir)
@@ -244,6 +379,8 @@ def _iter_source_files(
         if not manifest.enabled:
             log.info("Project '%s' disabled via manifest — skipping.", manifest.project_name)
             continue
+
+        gitignored = _load_gitignored_paths(project_dir)
 
         project_root_str = str(project_dir)
 
@@ -266,6 +403,13 @@ def _iter_source_files(
                     continue
 
                 file_path = Path(dirpath) / filename
+
+                if _is_gitignored(file_path, project_dir, gitignored):
+                    log.warning(
+                        "Skipping gitignored file (safety net, not manifest-configurable): %s",
+                        file_path,
+                    )
+                    continue
 
                 if not _is_allowed_file(file_path, manifest):
                     continue

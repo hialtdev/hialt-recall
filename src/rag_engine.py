@@ -47,15 +47,15 @@ def load_settings(env_path: Optional[str] = None) -> Settings:
     Raises RuntimeError if MONGO_URI is missing.
     """
     if env_path:
-        load_dotenv(dotenv_path=env_path, override=True)
+        dotenv_path = env_path
     else:
         this_dir = Path(__file__).resolve().parent
         root_dir = this_dir.parent
         dotenv_path = root_dir / ".env"
         if not dotenv_path.exists():
             dotenv_path = this_dir / ".env"
-            
-        load_dotenv(dotenv_path=dotenv_path, override=True)
+
+    load_dotenv(dotenv_path=dotenv_path, override=True)
 
     mongo_uri = os.environ.get("MONGO_URI", "").strip()
     if not mongo_uri:

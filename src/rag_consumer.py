@@ -5,9 +5,22 @@ Kafka consumer for hialt-recall.
 Reads raw chunk payloads from the ingest topic, embeds them via Ollama,
 and upserts the result (including the metadata block) into MongoDB.
 
-Manual offset commit ensures at-least-once delivery: the Kafka offset is
-only advanced after a verified MongoDB write, so a crash mid-flight leaves
-the message available for retry on the next startup.
+Manual offset commit ensures at-least-once delivery for the common case:
+the Kafka offset is only advanced after a verified MongoDB write.
+
+Kafka offsets are a single monotonic pointer per partition, not a per-message
+ack — committing message N+1 also implicitly "consumes" any earlier message
+whose commit you skipped. That means silently leaving a failed message
+uncommitted and moving on (relying on "the next restart" to retry it) does
+NOT work in general: as soon as any later message in the same partition
+commits successfully, the earlier failure is gone for good, restart or not.
+
+So a failed message is retried a bounded number of times in-process first
+(no need to re-fetch it from Kafka — we already have it in hand). If it still
+fails, it's recorded in a `<collection>_failed` dead-letter collection and
+the offset is committed anyway, so one bad chunk can't wedge the partition
+forever. Check that collection periodically for anything that needs manual
+reprocessing.
 """
 
 import json
@@ -15,6 +28,7 @@ import logging
 import os
 import sys
 import time
+from typing import Optional
 
 import requests
 from confluent_kafka import Consumer, KafkaError
@@ -33,8 +47,12 @@ logging.basicConfig(
 )
 log = logging.getLogger("hialt.consumer")
 
-# How long to wait before retrying a failed embed/write (seconds)
+# How long to wait between in-process retry attempts (seconds); multiplied
+# by the attempt number for a touch of backoff.
 RETRY_BACKOFF = 2
+
+# How many times to retry a single message in-process before dead-lettering it.
+MAX_ATTEMPTS = 3
 
 
 def _ensure_indexes(coll) -> None:
@@ -88,8 +106,10 @@ def run_consumer() -> None:
     mongo_client = MongoClient(settings.mongo_uri, serverSelectionTimeoutMS=5000)
     db   = mongo_client[settings.mongo_default_db]
     coll = db[settings.mongo_collection]
+    dead_letter_coll = db[f"{settings.mongo_collection}_failed"]
 
     _ensure_indexes(coll)
+    dead_letter_coll.create_index([("doc_id", ASCENDING)], unique=True, name="idx_doc_id")
 
     # Use settings.embedding_model so OLLAMA_EMBEDDING_MODEL env var controls
     # both ingest-time and query-time embedding — they must match.
@@ -140,45 +160,76 @@ def run_consumer() -> None:
 
             log.info("Processing: %s", file_ident)
 
-            # ── Embed + upsert (with simple retry) ────────────────────────
-            try:
-                # 1. Embed via Ollama using the settings-driven model name
-                embedding = _embed(ollama_base_url, embedding_model, content)
+            # ── Embed + upsert, with bounded in-process retry ──────────────
+            # We already hold the full message in memory, so retrying just
+            # re-runs the embed/write below — no need to touch Kafka until
+            # we're ready to commit (success) or dead-letter (exhausted).
+            last_exc: Optional[Exception] = None
 
-                # 2. Build the document to write.
-                #    payload already contains the nested "metadata" block written
-                #    by ingest.py:  {"metadata": {"project": ..., "tags": [...]}}
-                #    We add the embedding and write everything atomically.
-                doc = {**payload, settings.embedding_field: embedding}
+            for attempt in range(1, MAX_ATTEMPTS + 1):
+                try:
+                    # 1. Embed via Ollama using the settings-driven model name
+                    embedding = _embed(ollama_base_url, embedding_model, content)
 
-                # 3. Upsert on doc_id — the stable SHA-256 key from ingest.py.
-                #    This is O(1) via the unique index and handles file renames
-                #    correctly (a renamed file gets a new doc_id, leaving the
-                #    old document to age out or be pruned by a separate job).
-                coll.update_one(
-                    {"doc_id": doc_id},
-                    {"$set": doc},
-                    upsert=True,
+                    # 2. Build the document to write.
+                    #    payload already contains the nested "metadata" block written
+                    #    by ingest.py:  {"metadata": {"project": ..., "tags": [...]}}
+                    #    We add the embedding and write everything atomically.
+                    doc = {**payload, settings.embedding_field: embedding}
+
+                    # 3. Upsert on doc_id — the stable SHA-256 key from ingest.py.
+                    #    This is O(1) via the unique index and handles file renames
+                    #    correctly (a renamed file gets a new doc_id, leaving the
+                    #    old document to age out or be pruned by a separate job).
+                    coll.update_one(
+                        {"doc_id": doc_id},
+                        {"$set": doc},
+                        upsert=True,
+                    )
+
+                    # 4. Commit Kafka offset only after the DB write is confirmed
+                    consumer.commit(msg, asynchronous=False)
+                    log.info("✓ Upserted %s (attempt %d/%d)", doc_id, attempt, MAX_ATTEMPTS)
+                    break
+
+                except requests.RequestException as exc:
+                    last_exc = exc
+                    log.warning("Attempt %d/%d: Ollama embedding failed for %s: %s",
+                                attempt, MAX_ATTEMPTS, file_ident, exc)
+
+                except PyMongoError as exc:
+                    last_exc = exc
+                    log.warning("Attempt %d/%d: MongoDB write failed for %s: %s",
+                                attempt, MAX_ATTEMPTS, file_ident, exc)
+
+                except Exception as exc:  # noqa: BLE001
+                    last_exc = exc
+                    log.warning("Attempt %d/%d: Unexpected error processing %s: %s",
+                                attempt, MAX_ATTEMPTS, file_ident, exc, exc_info=True)
+
+                if attempt < MAX_ATTEMPTS:
+                    time.sleep(RETRY_BACKOFF * attempt)
+
+            else:
+                # Loop completed without `break` — every attempt failed.
+                # Record it for manual follow-up, then commit forward so this
+                # one bad chunk doesn't block everything behind it forever.
+                log.error(
+                    "Giving up on %s after %d attempts — moving to dead-letter. Last error: %s",
+                    file_ident, MAX_ATTEMPTS, last_exc,
                 )
-
-                # 4. Commit Kafka offset only after the DB write is confirmed
+                try:
+                    dead_letter_coll.update_one(
+                        {"doc_id": doc_id},
+                        {"$set": {**payload, "error": str(last_exc), "failed_at": time.time()}},
+                        upsert=True,
+                    )
+                except PyMongoError:
+                    log.error(
+                        "Also failed to write dead-letter record for %s — this chunk is being lost.",
+                        file_ident, exc_info=True,
+                    )
                 consumer.commit(msg, asynchronous=False)
-                log.info("✓ Upserted %s", doc_id)
-
-            except requests.HTTPError as exc:
-                log.error("Ollama embedding failed for %s: %s — will retry on restart.", file_ident, exc)
-                time.sleep(RETRY_BACKOFF)
-                # Do NOT commit — message stays in Kafka for retry
-
-            except PyMongoError as exc:
-                log.error("MongoDB write failed for %s: %s — will retry on restart.", file_ident, exc)
-                time.sleep(RETRY_BACKOFF)
-                # Do NOT commit
-
-            except Exception as exc:  # noqa: BLE001
-                log.error("Unexpected error processing %s: %s", file_ident, exc, exc_info=True)
-                time.sleep(RETRY_BACKOFF)
-                # Do NOT commit
 
     except KeyboardInterrupt:
         log.info("Gracefully shutting down RAG worker daemon…")
