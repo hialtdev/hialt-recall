@@ -14,7 +14,6 @@ import os
 from pathlib import Path
 from dotenv import load_dotenv
 from dataclasses import dataclass
-from pathlib import Path
 from typing import List, Optional, TypedDict
 
 import numpy as np
@@ -78,7 +77,7 @@ def load_settings(env_path: Optional[str] = None) -> Settings:
         embedding_field=os.environ.get("MONGO_EMBEDDING_FIELD", "embedding").strip(),
         ollama_llm_model=os.environ.get("OLLAMA_LLM_MODEL", "llama3").strip(),
         groq_api_key=os.environ.get("GROQ_API_KEY") or None,
-        groq_model=os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile").strip(),
+        groq_model=os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b").strip(),
         llm_temperature=float(os.environ.get("LLM_TEMPERATURE", "0.2").strip()),
         data_repos_dir=data_repos_dir,  # Passed back here
     )

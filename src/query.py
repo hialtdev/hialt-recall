@@ -14,7 +14,7 @@ import argparse
 import sys
 import textwrap
 
-from src.rag_engine import load_settings, run_query
+from rag_engine import load_settings, run_query
 
 
 def main() -> None:
