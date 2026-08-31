@@ -74,18 +74,34 @@ Pilot project, validated end-to-end (ingest + real cited query). Branch
 `recall-onboarding`, manifest written with `exclude_paths` for the real
 secret file. Being migrated onto the Gitea workflow above now.
 
-### bitbybit-service — owner: **open — suggested: Codex**
-Branch `recall-onboarding` exists on GitHub `origin` (base `dev`), not yet
-on Gitea. No file changes made yet. Known findings, ready to act on:
-- `README.md` is broken — an earlier AI session pasted a Python
-  string-wrapper (`readme_content = """# BitByBit ...`) directly into the
-  `.md` file; the code fence is never closed. Underlying content is good,
-  just needs re-saving as plain markdown.
-- `docs/bitbybit-cluster-runbook.md` and `docs/architecture/codebase-assessment.md`
-  are already wiki-quality — ready to ingest as-is once a manifest exists.
-- No `hialt-knowledge.yaml` yet. Needs one; also needs `.txt`/`.json`
-  extensions allow-listed for dev notes / Postman collection (same issue
-  KubeConfigs had with `bash commands.txt`).
+### bitbybit-service — owner: Codex
+Branch `recall-onboarding` now tracks Gitea `oci/recall-onboarding`; all
+pre-existing branches and tags were mirrored to the new empty Gitea repo
+before file edits. Recall-focused reevaluation is complete on Gitea commit
+`d1aa6a1`: the aspirational README was replaced with current backend boundaries,
+the existing codebase assessment was revalidated and tracked, a concise
+cross-stack retrieval guide was added, the backend runbook now distinguishes
+frontend/infrastructure ownership, and Postman examples now use `/api` routes
+and least-privileged sample registration.
+
+The manifest allow-lists docs/config formats and excludes both Mongo bootstrap
+files with embedded credential-like values plus test/mock fixtures. Exact scope
+testing exposed a hub bug where manifest file exclusions were documented but
+not honored; fixed with four regression tests on hialt-recall Gitea commit
+`3fab30c` before reindexing.
+
+The BitByBit Mongo slice was rebuilt to eliminate stale pre-exclusion and
+pre-rewrite chunks. Final verification matched all 266 expected current doc IDs
+with zero missing/stale records; excluded and ignored sources were absent.
+A local-only retrieval question ranked `docs/architecture/stack-context.md`
+first, followed by the corrected README and assessment. No repository content
+was sent to Groq.
+
+Pre-existing `k8s/base/backend-deployment.yaml` working-tree changes were
+preserved and not included in Codex's commits.
+
+Remaining: review the Gitea changes, then push finished work to GitHub under the
+project's normal review/merge process.
 - Stray file `${ENV:APP_LOG_PATH_ENV}` (literal filename) at repo root —
   looks like an unsubstituted Logback env var. Unrelated to recall ingestion,
   just flagged for whoever eventually touches logging config.
