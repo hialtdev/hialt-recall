@@ -80,7 +80,7 @@ class IngestionManifest:
     project_name: str
     project_tags: list[str] = field(default_factory=list)
     enabled: bool = True
-    # Normalised (no leading/trailing slash) relative paths to prune
+    # Normalised (no leading/trailing slash) relative files or directories to skip
     exclude_paths: frozenset[str] = field(default_factory=frozenset)
     # Empty == allow all extensions that pass _is_markdown/_is_code checks
     include_extensions: frozenset[str] = field(default_factory=frozenset)
@@ -178,10 +178,33 @@ def _is_excluded_dir(dir_name: str, rel_dir: str, manifest: IngestionManifest) -
     # 2. Manifest-specified paths
     candidate = _normalise_path(os.path.join(rel_dir, dir_name))
     for excluded in manifest.exclude_paths:
-        if candidate == excluded or candidate.startswith(excluded + "/"):
+        if (
+            dir_name == excluded
+            or candidate == excluded
+            or candidate.startswith(excluded + "/")
+        ):
             return True
 
     return False
+
+
+def _is_excluded_file(
+    filename: str,
+    rel_dir: str,
+    manifest: IngestionManifest,
+) -> bool:
+    """Return True when a file matches a manifest ``exclude_paths`` entry.
+
+    A slash-free entry matches that leaf filename anywhere in the project.
+    An entry containing a slash matches the exact project-relative file path.
+    Directory subtrees are pruned separately by :func:`_is_excluded_dir`.
+    """
+    candidate = _normalise_path(os.path.join(rel_dir, filename))
+    return any(
+        candidate == excluded
+        or ("/" not in excluded and filename == excluded)
+        for excluded in manifest.exclude_paths
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -403,6 +426,9 @@ def _iter_source_files(
                     continue
 
                 file_path = Path(dirpath) / filename
+
+                if _is_excluded_file(filename, rel_dir, manifest):
+                    continue
 
                 if _is_gitignored(file_path, project_dir, gitignored):
                     log.warning(

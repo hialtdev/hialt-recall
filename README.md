@@ -164,8 +164,9 @@ project:
 
 ingestion:
   enabled: true            # set false to skip this project entirely
-  exclude_paths:            # extra relative paths to prune, on top of the global defaults
+  exclude_paths:            # relative files/directories to skip, on top of the global defaults
     - docs/generated
+    - config/development-values.yaml
   include_extensions:       # if set, ONLY these extensions are ingested (overrides the markdown/code default)
     - .rs
     - .md
