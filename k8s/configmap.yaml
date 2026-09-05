@@ -14,9 +14,8 @@ data:
   OLLAMA_LLM_MODEL: "llama3"
   # ── Postgres / pgvector (shared cluster instance) ──────────────────────────
   # POSTGRES_URI itself lives in the hialt-recall-secrets Secret (key
-  # postgres-uri), same pattern the old mongodb-uri key used — it carries
-  # hialt-recall's own database + role on the shared instance, not the
-  # instance's admin credentials.
+  # postgres-uri). It carries hialt-recall's own database + role on the
+  # shared instance, not the instance's admin credentials.
   EMBEDDING_DIM: "1024"
   POSTGRES_TABLE: "chunks"
   POSTGRES_FAILED_TABLE: "chunks_failed"
