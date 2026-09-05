@@ -113,7 +113,7 @@ def load_settings(env_path: Optional[str] = None) -> Settings:
 # Postgres connection + schema
 # ---------------------------------------------------------------------------
 
-def get_connection(settings: Settings):
+def get_connection(settings: Settings, *, autocommit: bool = False):
     """
     Open a psycopg2 connection with pgvector's type adapters registered, so
     a Vector() can be bound to a `vector` column/parameter and a `vector`
@@ -129,6 +129,10 @@ def get_connection(settings: Settings):
     which no `vector` operator accepts. Always wrap embeddings in Vector().
     """
     conn = _connect_raw(settings)
+    # register_vector() executes a type lookup. Set autocommit first when a
+    # caller needs it; psycopg2 refuses to change the setting after that lookup
+    # has opened a transaction.
+    conn.autocommit = autocommit
     register_vector(conn)
     return conn
 

@@ -158,8 +158,7 @@ def run_consumer() -> None:
     # as the old long-lived MongoClient. autocommit=True so each statement
     # is its own transaction — a failed insert doesn't poison a later one,
     # which matters for the per-message retry loop below.
-    conn = get_connection(settings)
-    conn.autocommit = True
+    conn = get_connection(settings, autocommit=True)
 
     # Use settings.embedding_model so OLLAMA_EMBEDDING_MODEL env var controls
     # both ingest-time and query-time embedding — they must match.
