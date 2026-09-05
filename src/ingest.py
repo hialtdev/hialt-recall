@@ -14,10 +14,9 @@ from confluent_kafka import Producer
 from dotenv import load_dotenv
 from langchain_core.documents import Document
 from langchain_text_splitters import MarkdownHeaderTextSplitter
-from pymongo import MongoClient
 from tqdm import tqdm
 
-from rag_engine import load_settings, Settings
+from rag_engine import load_settings, Settings, get_connection, ensure_schema
 
 # Load environment variables early for local development fallback
 load_dotenv()
@@ -213,7 +212,7 @@ def _is_excluded_file(
 #
 # Unlike EXCLUDED_DIRS (which a manifest can't remove from, but which only
 # guards against noise), this guards against a chunk's text ending up in
-# Mongo AND being shipped to a third-party LLM (Groq) as RAG context on any
+# the datastore AND being shipped to a third-party LLM (Groq) as RAG context on any
 # query that happens to retrieve it. A careless or wrong manifest must never
 # be able to override this — false positives (a legitimate file skipped) are
 # a much cheaper mistake than a leaked credential, so this errs broad.
@@ -536,12 +535,15 @@ def main() -> None:
     settings = load_settings()
 
     if args.reset:
-        client = MongoClient(settings.mongo_uri)
-        db = client[settings.mongo_default_db]
-        collection = db[settings.mongo_collection]
-        collection.drop()
-        print("MongoDB collection dropped for reset.")
-        client.close()
+        ensure_schema(settings)  # no-op if already present; guarantees the table exists to truncate
+        conn = get_connection(settings)
+        try:
+            conn.autocommit = True
+            with conn.cursor() as cur:
+                cur.execute(f"TRUNCATE TABLE {settings.postgres_table};")
+            print(f"Postgres table '{settings.postgres_table}' truncated for reset.")
+        finally:
+            conn.close()
 
     # Dynamic bootstrap target for port-forward vs in-cluster deployment
     bootstrap_servers = os.environ.get('KAFKA_BOOTSTRAP_SERVERS', 'localhost:9092')

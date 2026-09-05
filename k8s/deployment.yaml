@@ -19,7 +19,7 @@ spec:
         - name: ghcr-secret
       containers:
         - name: ui
-          image: ghcr.io/hialtdev/hialt-recall:latest
+          image: ghcr.io/hialtdev/hialt-recall:postgres-pgvector-20260905
           imagePullPolicy: Always
           ports:
             - containerPort: 8501
@@ -32,11 +32,11 @@ spec:
                 secretKeyRef:
                   name: hialt-recall-secrets
                   key: groq-api-key
-            - name: MONGO_URI
+            - name: POSTGRES_URI
               valueFrom:
                 secretKeyRef:
                   name: hialt-recall-secrets
-                  key: mongodb-uri
+                  key: postgres-uri
           readinessProbe:
             httpGet:
               # Streamlit's built-in health endpoint. There is no bare
@@ -56,10 +56,10 @@ spec:
             failureThreshold: 3
           resources:
             requests:
-              memory: "256Mi"
+              memory: "192Mi"
               cpu: "250m"
             limits:
-              memory: "512Mi"
+              memory: "384Mi"
               cpu: "500m"
 ---
 apiVersion: apps/v1
@@ -83,22 +83,22 @@ spec:
         - name: ghcr-secret
       containers:
         - name: consumer
-          image: ghcr.io/hialtdev/hialt-recall:latest
+          image: ghcr.io/hialtdev/hialt-recall:postgres-pgvector-20260905
           imagePullPolicy: Always
           command: ["python", "src/rag_consumer.py"]
           envFrom:
             - configMapRef:
                 name: hialt-recall-config
           env:
-            - name: MONGO_URI
+            - name: POSTGRES_URI
               valueFrom:
                 secretKeyRef:
                   name: hialt-recall-secrets
-                  key: mongodb-uri
+                  key: postgres-uri
           resources:
             requests:
-              memory: "128Mi"
+              memory: "64Mi"
               cpu: "100m"
             limits:
-              memory: "512Mi"
+              memory: "256Mi"
               cpu: "500m"

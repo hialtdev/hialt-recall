@@ -19,7 +19,7 @@ from rag_engine import load_settings, run_query
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Query the local MongoDB RAG store.",
+        description="Query the local Postgres/pgvector RAG store.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=textwrap.dedent("""
             Examples:

@@ -2,7 +2,7 @@
 
 A local-first RAG (Retrieval-Augmented Generation) pipeline for the hialt.dev home lab. Ask natural language questions about your own codebases and get cited answers grounded in your actual source files.
 
-**No special MongoDB plugins or `mongot` required.** Embeddings are stored as plain arrays; similarity search is done entirely in-process with numpy cosine similarity.
+**Storage is PostgreSQL + pgvector**, on the shared `postgres-main` instance the platform runs in the `database` namespace. Embeddings live in a `vector(1024)` column and similarity search runs server-side against an HNSW index, so retrieval no longer scans every stored chunk. Migrated from MongoDB in September 2026.
 
 ---
 
@@ -10,9 +10,9 @@ A local-first RAG (Retrieval-Augmented Generation) pipeline for the hialt.dev ho
 
 The pipeline is a two-stage producer/consumer split around Kafka, plus a retrieval layer shared by the CLI and the web UI:
 
-1. `src/ingest.py` walks `./data/repos/<project>/**`, chunks Markdown files by headers and code files by character boundaries, and **publishes** each chunk (plus project/tag metadata) as a message to a Kafka topic. It does not touch Mongo or Ollama directly.
-2. `src/rag_consumer.py` consumes that Kafka topic, embeds each chunk with Ollama (`mxbai-embed-large`), and upserts chunks + raw embedding arrays into a plain MongoDB collection. It must be running (locally or in the cluster) for ingested chunks to actually become queryable — see [§6](#6-run-the-consumer).
-3. `src/query.py` (CLI) / `src/app.py` (Streamlit UI) embed the user query, fetch stored embeddings from MongoDB, rank them with numpy cosine similarity, and feed the top-k chunks to Groq (fast, cloud LLM) with Ollama as a local fallback. Shared logic lives in `src/rag_engine.py`.
+1. `src/ingest.py` walks `./data/repos/<project>/**`, chunks Markdown files by headers and code files by character boundaries, and **publishes** each chunk (plus project/tag metadata) as a message to a Kafka topic. It does not touch Postgres or Ollama directly.
+2. `src/rag_consumer.py` consumes that Kafka topic, embeds each chunk with Ollama (`mxbai-embed-large`), and upserts chunks + embeddings into the `chunks` table. It must be running (locally or in the cluster) for ingested chunks to actually become queryable — see [§6](#6-run-the-consumer).
+3. `src/query.py` (CLI) / `src/app.py` (Streamlit UI) embed the user query, ask Postgres for the nearest chunks by cosine distance, and feed the top-k to Groq (fast, cloud LLM) with Ollama as a local fallback. Shared logic lives in `src/rag_engine.py`.
 
 ---
 
@@ -27,7 +27,7 @@ hialt-recall/
 │       └── bitbybit-frontend -> /home/user/WebstormProjects/bitbybit-react-ts-portfolio
 ├── src/
 │   ├── ingest.py          # Kafka producer — walks + chunks source files
-│   ├── rag_consumer.py    # Kafka consumer — embeds + writes to MongoDB
+│   ├── rag_consumer.py    # Kafka consumer — embeds + writes to Postgres
 │   ├── rag_engine.py      # Shared retrieval/generation logic
 │   ├── query.py           # CLI entrypoint
 │   └── app.py             # Streamlit UI entrypoint
@@ -63,11 +63,10 @@ ollama pull mxbai-embed-large   # embedding model
 ollama pull llama3              # local LLM fallback
 ```
 
-- MongoDB accessible on `localhost:27017` via k3s port-forward:
+- PostgreSQL accessible on `localhost:5432` via k3s port-forward. This is the shared `postgres-main` instance managed by CloudNativePG; `-rw` is the read/write primary service:
 
 ```bash
-# Note: use your actual k3s service name
-kubectl port-forward svc/mongodb-service 27017:27017
+kubectl port-forward -n database svc/postgres-main-rw 5432:5432
 ```
 
 - A Kafka broker accessible on `localhost:9092`. In the hialt.dev cluster this is a Strimzi-managed broker; port-forward it the same way:
@@ -92,8 +91,9 @@ cp .env.example .env
 Edit `.env` — the critical variables:
 
 ```env
-# MongoDB with authentication (required for k3s-hosted MongoDB)
-MONGO_URI=mongodb://username:password@localhost:27017/local_rag?authSource=admin
+# Postgres. hialt-recall has its own role and database on the shared
+# instance — never point this at another service's credentials.
+POSTGRES_URI=postgresql://hialt_recall:password@localhost:5432/hialt_recall
 
 # Ollama (local embedding + LLM fallback)
 OLLAMA_BASE_URL=http://localhost:11434
@@ -104,10 +104,12 @@ OLLAMA_LLM_MODEL=llama3
 GROQ_API_KEY=gsk_your_key_here
 GROQ_MODEL=openai/gpt-oss-120b
 
-# MongoDB collection
-MONGO_DB_NAME=local_rag
-MONGO_COLLECTION=rag_chunks
-MONGO_EMBEDDING_FIELD=embedding
+# Postgres tables. EMBEDDING_DIM must match what OLLAMA_EMBEDDING_MODEL
+# actually produces — a pgvector column has a fixed width, set when the
+# table is created. mxbai-embed-large produces 1024 dimensions.
+EMBEDDING_DIM=1024
+POSTGRES_TABLE=chunks
+POSTGRES_FAILED_TABLE=chunks_failed
 
 LLM_TEMPERATURE=0.2
 
@@ -117,7 +119,9 @@ KAFKA_TOPIC=hialt-recall-chunks
 KAFKA_CONSUMER_GROUP=hialt-recall-workers
 ```
 
-No special MongoDB index setup is needed for the embeddings themselves — they're stored as plain arrays. `rag_consumer.py` does create a couple of lookup indexes (`doc_id`, `metadata.project`, `metadata.tags`) automatically on first startup.
+No manual schema setup is needed. `rag_engine.ensure_schema()` runs at consumer startup and creates the `chunks` and `chunks_failed` tables, the `project_dir`/`project_name`/`tags` lookup indexes, and the HNSW index on `embedding`, all with `IF NOT EXISTS`.
+
+The one thing it cannot create is the `vector` extension itself: pgvector is not a trusted extension, so the owning role is not allowed to install it. The platform provisions it declaratively instead, through the `extensions` block on the `Database` resource in `hialt-platform`. Against a database where the extension is missing, every connection fails with `vector type not found in the database`.
 
 ---
 
@@ -135,7 +139,7 @@ pip install -r requirements.txt
 
 ## 5. Ingest documents
 
-`ingest.py` only *publishes* chunks to Kafka — it does not embed or write to Mongo itself. The [consumer](#6-run-the-consumer) must be running for anything you ingest here to actually show up in queries.
+`ingest.py` only *publishes* chunks to Kafka — it does not embed or write to Postgres itself. The [consumer](#6-run-the-consumer) must be running for anything you ingest here to actually show up in queries.
 
 ```bash
 source .venv/bin/activate
@@ -178,13 +182,13 @@ A missing or invalid manifest falls back to sane defaults (project name = direct
 
 | Flag | Description |
 |------|-------------|
-| `--reset` | ⚠️ Drop the entire collection and re-ingest from scratch |
+| `--reset` | ⚠️ Truncate the chunks table and re-ingest from scratch |
 | `--max-files N` | Cap total files processed (useful for testing) |
 | `--project NAME` | Only ingest the project directory matching this name |
 
 ### ⚠️ Warning: --reset is destructive
 
-`--reset` drops your entire MongoDB collection. All embeddings are permanently deleted and must be re-generated from scratch.
+`--reset` truncates the `chunks` table. All embeddings are permanently deleted and must be re-generated from scratch. It leaves `chunks_failed` alone, so dead-lettered rows survive a reset.
 
 On an HP EliteDesk i5, a full ingest of 3 projects (~750 chunks) takes approximately **10 minutes** end-to-end (publish + consume + embed). Plan accordingly before using this flag.
 
@@ -202,14 +206,14 @@ On an HP EliteDesk i5, a full ingest of 3 projects (~750 chunks) takes approxima
 
 ## 6. Run the consumer
 
-`rag_consumer.py` is the other half of the pipeline: it reads chunk messages off the Kafka topic, embeds each one via Ollama, and upserts the result into MongoDB. It's a long-running process — start it before (or while) you run `ingest.py`, and leave it running:
+`rag_consumer.py` is the other half of the pipeline: it reads chunk messages off the Kafka topic, embeds each one via Ollama, and upserts the result into Postgres. It's a long-running process — start it before (or while) you run `ingest.py`, and leave it running:
 
 ```bash
 source .venv/bin/activate
 python3 src/rag_consumer.py
 ```
 
-It commits Kafka offsets only after a successful MongoDB write, so it's safe to `Ctrl+C` and restart — any in-flight or un-embedded messages will simply be reprocessed. In the cluster this runs as the `hialt-recall-consumer` deployment (see `k8s/deployment.yaml`).
+It commits Kafka offsets only after a successful Postgres write, so it's safe to `Ctrl+C` and restart — any in-flight or un-embedded messages will simply be reprocessed. In the cluster this runs as the `hialt-recall-consumer` deployment (see `k8s/deployment.yaml`).
 
 ---
 
@@ -261,21 +265,12 @@ After a fresh ingest, run these to confirm everything is working:
 
 ```bash
 # Check chunk count by project
-python3 -c "
-from dotenv import load_dotenv
-from pymongo import MongoClient
-import os
-load_dotenv('.env')
-client = MongoClient(os.environ['MONGO_URI'])
-db = client[os.environ.get('MONGO_DB_NAME', 'local_rag')]
-coll = db[os.environ.get('MONGO_COLLECTION', 'rag_chunks')]
-pipeline = [
-    {'\$group': {'_id': '\$metadata.project', 'count': {'\$sum': 1}}},
-    {'\$sort': {'count': -1}}
-]
-for doc in coll.aggregate(pipeline):
-    print(doc)
-"
+psql "$POSTGRES_URI" -c \
+  "SELECT project_name, count(*) FROM chunks GROUP BY project_name ORDER BY count DESC;"
+
+# Anything that failed to embed or write ends up here
+psql "$POSTGRES_URI" -c \
+  "SELECT source_file, error, failed_at FROM chunks_failed ORDER BY failed_at DESC LIMIT 20;"
 ```
 
 If any project has an unexpectedly large chunk count (tens of thousands), it likely swept up `node_modules` or a build directory. Use `--reset` and check your symlink targets.
@@ -284,7 +279,11 @@ If any project has an unexpectedly large chunk count (tens of thousands), it lik
 
 ## Notes on scaling
 
-The current retriever fetches all matching documents and ranks them in-process with numpy — it does not use a vector index. This is fine for home lab repo collections (hundreds to low thousands of chunks), especially combined with the `--project`/`--tag` filters (backed by the `metadata.project`/`metadata.tags` indexes `rag_consumer.py` creates automatically) to narrow the candidate set before ranking. If you accumulate tens of thousands of legitimate chunks and retrieval latency becomes noticeable, that's the point to look at a real ANN index (MongoDB Atlas Vector Search, or an embedded engine — see `ARCHITECTURE_BACKLOG_RUST_INTEGRATION.md` for one direction being considered).
+Retrieval now runs server-side against a pgvector HNSW index using cosine distance, so ranking cost no longer grows linearly with the size of the collection. That was the main motivation for leaving MongoDB, where every candidate had to be pulled into the client and scored with numpy.
+
+Two things to know about the index. HNSW is approximate, so a low-recall result set is tuned with `hnsw.ef_search` rather than by adding candidates. And `--project`/`--tag` filters apply as a `WHERE` clause on top of the index scan, which can under-fill the result set when a filter is highly selective. If that shows up in practice, the usual fix is a partial index per project or raising `ef_search` for filtered queries.
+
+For alternative retrieval directions being considered, see `ARCHITECTURE_BACKLOG_RUST_INTEGRATION.md`.
 
 ---
 
