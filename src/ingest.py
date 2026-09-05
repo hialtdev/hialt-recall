@@ -212,7 +212,7 @@ def _is_excluded_file(
 #
 # Unlike EXCLUDED_DIRS (which a manifest can't remove from, but which only
 # guards against noise), this guards against a chunk's text ending up in
-# Mongo AND being shipped to a third-party LLM (Groq) as RAG context on any
+# the datastore AND being shipped to a third-party LLM (Groq) as RAG context on any
 # query that happens to retrieve it. A careless or wrong manifest must never
 # be able to override this — false positives (a legitimate file skipped) are
 # a much cheaper mistake than a leaked credential, so this errs broad.
