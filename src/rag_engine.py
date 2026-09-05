@@ -14,7 +14,6 @@ import os
 from pathlib import Path
 from dotenv import load_dotenv
 from dataclasses import dataclass
-from pathlib import Path
 from typing import List, Optional, TypedDict
 
 import numpy as np
@@ -48,15 +47,15 @@ def load_settings(env_path: Optional[str] = None) -> Settings:
     Raises RuntimeError if MONGO_URI is missing.
     """
     if env_path:
-        load_dotenv(dotenv_path=env_path, override=True)
+        dotenv_path = env_path
     else:
         this_dir = Path(__file__).resolve().parent
         root_dir = this_dir.parent
         dotenv_path = root_dir / ".env"
         if not dotenv_path.exists():
             dotenv_path = this_dir / ".env"
-            
-        load_dotenv(dotenv_path=dotenv_path, override=True)
+
+    load_dotenv(dotenv_path=dotenv_path, override=True)
 
     mongo_uri = os.environ.get("MONGO_URI", "").strip()
     if not mongo_uri:
@@ -78,7 +77,7 @@ def load_settings(env_path: Optional[str] = None) -> Settings:
         embedding_field=os.environ.get("MONGO_EMBEDDING_FIELD", "embedding").strip(),
         ollama_llm_model=os.environ.get("OLLAMA_LLM_MODEL", "llama3").strip(),
         groq_api_key=os.environ.get("GROQ_API_KEY") or None,
-        groq_model=os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile").strip(),
+        groq_model=os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b").strip(),
         llm_temperature=float(os.environ.get("LLM_TEMPERATURE", "0.2").strip()),
         data_repos_dir=data_repos_dir,  # Passed back here
     )
