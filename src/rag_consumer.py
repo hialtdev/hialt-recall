@@ -3,10 +3,10 @@
 Kafka consumer for hialt-recall.
 
 Reads raw chunk payloads from the ingest topic, embeds them via Ollama,
-and upserts the result (including the metadata block) into MongoDB.
+and upserts the result into Postgres (via pgvector).
 
 Manual offset commit ensures at-least-once delivery for the common case:
-the Kafka offset is only advanced after a verified MongoDB write.
+the Kafka offset is only advanced after a verified Postgres write.
 
 Kafka offsets are a single monotonic pointer per partition, not a per-message
 ack — committing message N+1 also implicitly "consumes" any earlier message
@@ -17,26 +17,24 @@ commits successfully, the earlier failure is gone for good, restart or not.
 
 So a failed message is retried a bounded number of times in-process first
 (no need to re-fetch it from Kafka — we already have it in hand). If it still
-fails, it's recorded in a `<collection>_failed` dead-letter collection and
-the offset is committed anyway, so one bad chunk can't wedge the partition
-forever. Check that collection periodically for anything that needs manual
-reprocessing.
+fails, it's recorded in the dead-letter table and the offset is committed
+anyway, so one bad chunk can't wedge the partition forever. Check that table
+periodically for anything that needs manual reprocessing.
 """
 
 import json
 import logging
 import os
-import sys
 import time
 from typing import Optional
 
+import psycopg2
 import requests
 from confluent_kafka import Consumer, KafkaError
+from pgvector import Vector
 from dotenv import load_dotenv
-from pymongo import MongoClient, ASCENDING
-from pymongo.errors import PyMongoError
 
-from rag_engine import load_settings
+from rag_engine import load_settings, get_connection, ensure_schema, Settings
 
 load_dotenv()
 
@@ -55,23 +53,6 @@ RETRY_BACKOFF = 2
 MAX_ATTEMPTS = 3
 
 
-def _ensure_indexes(coll) -> None:
-    """
-    Create indexes the first time the consumer starts.
-
-    - Unique index on doc_id  → correct upsert key, prevents duplicates,
-                                 O(1) lookup instead of full collection scan.
-    - Index on metadata.project → makes project_filter queries efficient.
-    - Index on metadata.tags    → makes tag_filter $in queries efficient.
-
-    create_index() is idempotent — safe to call on every startup.
-    """
-    coll.create_index([("doc_id", ASCENDING)], unique=True, name="idx_doc_id")
-    coll.create_index([("metadata.project", ASCENDING)], name="idx_metadata_project")
-    coll.create_index([("metadata.tags",    ASCENDING)], name="idx_metadata_tags")
-    log.info("MongoDB indexes verified.")
-
-
 def _embed(ollama_base_url: str, model: str, text: str) -> list[float]:
     """Call Ollama /api/embeddings and return the vector."""
     resp = requests.post(
@@ -83,16 +64,86 @@ def _embed(ollama_base_url: str, model: str, text: str) -> list[float]:
     return [float(x) for x in resp.json()["embedding"]]
 
 
+def _upsert_chunk(conn, settings: Settings, payload: dict, embedding: list[float]) -> None:
+    """
+    Insert or update one chunk row, keyed by doc_id (the stable SHA-256 key
+    from ingest.py). Equivalent to the old Mongo update_one(upsert=True).
+    """
+    metadata = payload.get("metadata") or {}
+    with conn.cursor() as cur:
+        cur.execute(
+            f"""
+            INSERT INTO {settings.postgres_table}
+                (doc_id, project_dir, project_name, tags, source_file,
+                 chunk_index, headers, text, embedding, updated_at)
+            VALUES (%(doc_id)s, %(project_dir)s, %(project_name)s, %(tags)s,
+                    %(source_file)s, %(chunk_index)s, %(headers)s, %(text)s,
+                    %(embedding)s, now())
+            ON CONFLICT (doc_id) DO UPDATE SET
+                project_dir  = EXCLUDED.project_dir,
+                project_name = EXCLUDED.project_name,
+                tags         = EXCLUDED.tags,
+                source_file  = EXCLUDED.source_file,
+                chunk_index  = EXCLUDED.chunk_index,
+                headers      = EXCLUDED.headers,
+                text         = EXCLUDED.text,
+                embedding    = EXCLUDED.embedding,
+                updated_at   = now();
+            """,
+            {
+                "doc_id": payload["doc_id"],
+                "project_dir": payload.get("project", ""),
+                "project_name": metadata.get("project") or payload.get("project", ""),
+                "tags": metadata.get("tags") or [],
+                "source_file": payload.get("source_file", ""),
+                "chunk_index": payload.get("chunk_index", 0),
+                "headers": payload.get("headers", ""),
+                "text": payload.get("text", ""),
+                # Vector(), not a plain list — psycopg2 renders a list as
+                # ARRAY[...], which is not assignable to a `vector` column.
+                "embedding": Vector(embedding),
+            },
+        )
+
+
+def _record_failure(conn, settings: Settings, payload: dict, error: str) -> None:
+    """Write a dead-letter row for a chunk that exhausted MAX_ATTEMPTS."""
+    metadata = payload.get("metadata") or {}
+    with conn.cursor() as cur:
+        cur.execute(
+            f"""
+            INSERT INTO {settings.postgres_failed_table}
+                (doc_id, project_dir, project_name, tags, source_file,
+                 chunk_index, headers, text, error, failed_at)
+            VALUES (%(doc_id)s, %(project_dir)s, %(project_name)s, %(tags)s,
+                    %(source_file)s, %(chunk_index)s, %(headers)s, %(text)s,
+                    %(error)s, now())
+            ON CONFLICT (doc_id) DO UPDATE SET
+                error     = EXCLUDED.error,
+                failed_at = EXCLUDED.failed_at;
+            """,
+            {
+                "doc_id": payload.get("doc_id"),
+                "project_dir": payload.get("project", ""),
+                "project_name": metadata.get("project") or "",
+                "tags": metadata.get("tags") or [],
+                "source_file": payload.get("source_file", ""),
+                "chunk_index": payload.get("chunk_index", 0),
+                "headers": payload.get("headers", ""),
+                "text": payload.get("text", ""),
+                "error": error,
+            },
+        )
+
+
 def run_consumer() -> None:
     settings = load_settings()
+    ensure_schema(settings)
 
     bootstrap_servers = os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
     consumer_group    = os.environ.get("KAFKA_CONSUMER_GROUP",    "hialt-recall-workers")
 
     # ── Topic must match ingest.py's default exactly ───────────────────────
-    # ingest.py defaults to "hialt-recall-chunks"; the old consumer defaulted
-    # to "rag-raw-chunks".  Both now read from the same env var with the same
-    # fallback so they stay in sync without manual co-ordination.
     kafka_topic = os.environ.get("KAFKA_TOPIC", "hialt-recall-chunks")
 
     consumer = Consumer({
@@ -103,13 +154,12 @@ def run_consumer() -> None:
     })
     consumer.subscribe([kafka_topic])
 
-    mongo_client = MongoClient(settings.mongo_uri, serverSelectionTimeoutMS=5000)
-    db   = mongo_client[settings.mongo_default_db]
-    coll = db[settings.mongo_collection]
-    dead_letter_coll = db[f"{settings.mongo_collection}_failed"]
-
-    _ensure_indexes(coll)
-    dead_letter_coll.create_index([("doc_id", ASCENDING)], unique=True, name="idx_doc_id")
+    # Single long-lived connection for the life of the consumer, same shape
+    # as the old long-lived MongoClient. autocommit=True so each statement
+    # is its own transaction — a failed insert doesn't poison a later one,
+    # which matters for the per-message retry loop below.
+    conn = get_connection(settings)
+    conn.autocommit = True
 
     # Use settings.embedding_model so OLLAMA_EMBEDDING_MODEL env var controls
     # both ingest-time and query-time embedding — they must match.
@@ -171,23 +221,13 @@ def run_consumer() -> None:
                     # 1. Embed via Ollama using the settings-driven model name
                     embedding = _embed(ollama_base_url, embedding_model, content)
 
-                    # 2. Build the document to write.
-                    #    payload already contains the nested "metadata" block written
-                    #    by ingest.py:  {"metadata": {"project": ..., "tags": [...]}}
-                    #    We add the embedding and write everything atomically.
-                    doc = {**payload, settings.embedding_field: embedding}
+                    # 2. Upsert on doc_id — the stable SHA-256 key from ingest.py.
+                    #    ON CONFLICT handles file renames correctly (a renamed
+                    #    file gets a new doc_id, leaving the old row to age out
+                    #    or be pruned by a separate job).
+                    _upsert_chunk(conn, settings, payload, embedding)
 
-                    # 3. Upsert on doc_id — the stable SHA-256 key from ingest.py.
-                    #    This is O(1) via the unique index and handles file renames
-                    #    correctly (a renamed file gets a new doc_id, leaving the
-                    #    old document to age out or be pruned by a separate job).
-                    coll.update_one(
-                        {"doc_id": doc_id},
-                        {"$set": doc},
-                        upsert=True,
-                    )
-
-                    # 4. Commit Kafka offset only after the DB write is confirmed
+                    # 3. Commit Kafka offset only after the DB write is confirmed
                     consumer.commit(msg, asynchronous=False)
                     log.info("✓ Upserted %s (attempt %d/%d)", doc_id, attempt, MAX_ATTEMPTS)
                     break
@@ -197,9 +237,9 @@ def run_consumer() -> None:
                     log.warning("Attempt %d/%d: Ollama embedding failed for %s: %s",
                                 attempt, MAX_ATTEMPTS, file_ident, exc)
 
-                except PyMongoError as exc:
+                except psycopg2.Error as exc:
                     last_exc = exc
-                    log.warning("Attempt %d/%d: MongoDB write failed for %s: %s",
+                    log.warning("Attempt %d/%d: Postgres write failed for %s: %s",
                                 attempt, MAX_ATTEMPTS, file_ident, exc)
 
                 except Exception as exc:  # noqa: BLE001
@@ -219,12 +259,8 @@ def run_consumer() -> None:
                     file_ident, MAX_ATTEMPTS, last_exc,
                 )
                 try:
-                    dead_letter_coll.update_one(
-                        {"doc_id": doc_id},
-                        {"$set": {**payload, "error": str(last_exc), "failed_at": time.time()}},
-                        upsert=True,
-                    )
-                except PyMongoError:
+                    _record_failure(conn, settings, payload, str(last_exc))
+                except psycopg2.Error:
                     log.error(
                         "Also failed to write dead-letter record for %s — this chunk is being lost.",
                         file_ident, exc_info=True,
@@ -235,7 +271,7 @@ def run_consumer() -> None:
         log.info("Gracefully shutting down RAG worker daemon…")
     finally:
         consumer.close()
-        mongo_client.close()
+        conn.close()
 
 
 if __name__ == "__main__":

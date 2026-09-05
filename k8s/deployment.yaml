@@ -32,11 +32,11 @@ spec:
                 secretKeyRef:
                   name: hialt-recall-secrets
                   key: groq-api-key
-            - name: MONGO_URI
+            - name: POSTGRES_URI
               valueFrom:
                 secretKeyRef:
                   name: hialt-recall-secrets
-                  key: mongodb-uri
+                  key: postgres-uri
           readinessProbe:
             httpGet:
               # Streamlit's built-in health endpoint. There is no bare
@@ -90,11 +90,11 @@ spec:
             - configMapRef:
                 name: hialt-recall-config
           env:
-            - name: MONGO_URI
+            - name: POSTGRES_URI
               valueFrom:
                 secretKeyRef:
                   name: hialt-recall-secrets
-                  key: mongodb-uri
+                  key: postgres-uri
           resources:
             requests:
               memory: "128Mi"

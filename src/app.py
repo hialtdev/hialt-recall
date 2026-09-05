@@ -208,7 +208,7 @@ footer { display: none !important; }
 """, unsafe_allow_html=True)
 
 # ── Imports after page config ───────────────────────────────────────────────
-from pymongo import MongoClient
+import psycopg2
 
 from rag_engine import load_settings, run_query, Settings, RAGResult
 
@@ -216,23 +216,23 @@ from rag_engine import load_settings, run_query, Settings, RAGResult
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 @st.cache_data(ttl=60, show_spinner=False)
-def _fetch_filter_options(mongo_uri: str, db_name: str, collection: str) -> tuple[list[str], list[str]]:
+def _fetch_filter_options(postgres_uri: str, table: str) -> tuple[list[str], list[str]]:
     """
-    Return (projects, tags) as sorted lists of distinct values present in MongoDB.
-    Cached for 60 s so the sidebar doesn't hit Mongo on every keystroke.
+    Return (projects, tags) as sorted lists of distinct values present in Postgres.
+    Cached for 60 s so the sidebar doesn't hit the DB on every keystroke.
     Falls back to empty lists on any connection error.
     """
     try:
-        client = MongoClient(mongo_uri, serverSelectionTimeoutMS=2000)
-        coll   = client[db_name][collection]
-        projects: list[str] = sorted(
-            v for v in coll.distinct("metadata.project") if v
-        )
-        raw_tags: list[list] = coll.distinct("metadata.tags")
-        # distinct on an array field returns the individual array elements
-        tags: list[str] = sorted({str(t) for t in raw_tags if t})
-        client.close()
-        return projects, tags
+        conn = psycopg2.connect(postgres_uri, connect_timeout=2)
+        try:
+            with conn.cursor() as cur:
+                cur.execute(f"SELECT DISTINCT project_name FROM {table} WHERE project_name IS NOT NULL;")
+                projects: list[str] = sorted(r[0] for r in cur.fetchall() if r[0])
+                cur.execute(f"SELECT DISTINCT unnest(tags) FROM {table};")
+                tags: list[str] = sorted({r[0] for r in cur.fetchall() if r[0]})
+            return projects, tags
+        finally:
+            conn.close()
     except Exception:  # noqa: BLE001
         return [], []
 
@@ -258,7 +258,7 @@ with st.sidebar:
     top_k = st.slider(
         "Top-K chunks",
         min_value=1, max_value=20, value=3, step=1,
-        help="Number of context chunks retrieved from MongoDB before sending to the LLM.",
+        help="Number of context chunks retrieved from Postgres before sending to the LLM.",
     )
 
     force_ollama = st.toggle(
@@ -276,7 +276,7 @@ with st.sidebar:
 
     if cfg:
         projects, tags = _fetch_filter_options(
-            cfg.mongo_uri, cfg.mongo_default_db, cfg.mongo_collection
+            cfg.postgres_uri, cfg.postgres_table
         )
 
     project_options = ["— all projects —"] + projects
@@ -315,8 +315,7 @@ with st.sidebar:
     if cfg:
         st.markdown(f"""
 <div style="font-family: var(--mono); font-size: 0.72rem; color: var(--muted); line-height: 1.9;">
-  <b style="color:var(--text);">DB</b>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;{cfg.mongo_default_db}<br>
-  <b style="color:var(--text);">Col</b>&nbsp;&nbsp;&nbsp;&nbsp;{cfg.mongo_collection}<br>
+  <b style="color:var(--text);">Table</b>&nbsp;&nbsp;&nbsp;{cfg.postgres_table}<br>
   <b style="color:var(--text);">Embed</b>&nbsp;&nbsp;{cfg.embedding_model}<br>
   <b style="color:var(--text);">Groq</b>&nbsp;&nbsp;&nbsp;{'✓ ' + cfg.groq_model if cfg.groq_api_key else '✗ not configured'}<br>
   <b style="color:var(--text);">Ollama</b>&nbsp;{cfg.ollama_llm_model}
@@ -348,7 +347,7 @@ st.markdown("""
 
 # Config error banner
 if st.session_state.settings_error:
-    st.error(f"⚠️ Configuration error: {st.session_state.settings_error}\n\nCheck that `.env` exists and `MONGO_URI` is set.")
+    st.error(f"⚠️ Configuration error: {st.session_state.settings_error}\n\nCheck that `.env` exists and `POSTGRES_URI` is set.")
     st.stop()
 
 # Query input

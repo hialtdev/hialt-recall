@@ -9,8 +9,11 @@ section before handing off.
 
 ## The strategy, in short
 
-hialt-recall is a local RAG pipeline (Kafka → Ollama embeddings → MongoDB →
-Groq/Ollama generation). The goal is to ingest every hialtdev project's
+hialt-recall is a local RAG pipeline (Kafka → Ollama embeddings → Postgres +
+pgvector → Groq/Ollama generation). The datastore moved off MongoDB onto the
+shared `postgres-main` CloudNativePG instance in the `database` namespace in
+September 2026; hialt-recall owns the `hialt_recall` role and database there.
+The goal is to ingest every hialtdev project's
 docs/config/runbooks so cross-project questions get real, cited answers
 instead of living only in someone's head. Pattern per project: branch first
 → write/fix a `hialt-knowledge.yaml` manifest → symlink into
