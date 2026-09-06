@@ -49,14 +49,24 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v3
+
+      - name: Configure kubeconfig
+        run: |
+          mkdir -p ~/.kube
+          echo "${{ secrets.KUBECONFIG_CI }}" | base64 -d > ~/.kube/config
+          chmod 600 ~/.kube/config
+
       - name: Deploy to k3s
-        uses: appleboy/ssh-action@v1
-        with:
-          host: ${{ secrets.K3S_HOST }}
-          username: ${{ secrets.K3S_USER }}
-          key: ${{ secrets.K3S_SSH_KEY }}
-          script: |
-            kubectl set image deployment/hialt-recall-ui ui=${{ env.IMAGE_NAME }}:latest -n hialt-recall
-            kubectl set image deployment/hialt-recall-consumer consumer=${{ env.IMAGE_NAME }}:latest -n hialt-recall
-            kubectl rollout status deployment/hialt-recall-ui -n hialt-recall --timeout=120s
-            kubectl rollout status deployment/hialt-recall-consumer -n hialt-recall --timeout=120s
+        run: |
+          kubectl set image deployment/hialt-recall-ui \
+            ui=${{ env.IMAGE_NAME }}:latest \
+            -n hialt-recall
+          kubectl set image deployment/hialt-recall-consumer \
+            consumer=${{ env.IMAGE_NAME }}:latest \
+            -n hialt-recall
+          kubectl rollout status deployment/hialt-recall-ui \
+            -n hialt-recall --timeout=180s
+          kubectl rollout status deployment/hialt-recall-consumer \
+            -n hialt-recall --timeout=180s
