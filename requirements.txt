@@ -1,10 +1,12 @@
 # hialt-recall requirements
 # Original deps
-pymongo>=4.7.0
 requests>=2.31.0
 python-dotenv>=1.0.1
 tqdm>=4.66.0
-numpy>=1.26.0
+
+# Postgres + pgvector (migrated 2026-09 from MongoDB)
+psycopg2-binary>=2.9.9
+pgvector>=0.3.6
 
 # Text chunking (used by ingest.py)
 langchain-text-splitters>=0.3.0

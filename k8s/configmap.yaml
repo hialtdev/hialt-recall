@@ -12,10 +12,13 @@ data:
   OLLAMA_BASE_URL: "http://ollama-service.hialt-recall.svc.cluster.local:11434"
   OLLAMA_EMBEDDING_MODEL: "mxbai-embed-large"
   OLLAMA_LLM_MODEL: "llama3"
-  # ── MongoDB Configuration ──────────────────────────────────────────────────
-  MONGO_DB_NAME: "local_rag"
-  MONGO_COLLECTION: "rag_chunks"
-  MONGO_EMBEDDING_FIELD: "embedding"
+  # ── Postgres / pgvector (shared cluster instance) ──────────────────────────
+  # POSTGRES_URI itself lives in the hialt-recall-secrets Secret (key
+  # postgres-uri). It carries hialt-recall's own database + role on the
+  # shared instance, not the instance's admin credentials.
+  EMBEDDING_DIM: "1024"
+  POSTGRES_TABLE: "chunks"
+  POSTGRES_FAILED_TABLE: "chunks_failed"
   # ── LLM ───────────────────────────────────────────────────────────────────
   LLM_TEMPERATURE: "0.2"
   GROQ_MODEL: "openai/gpt-oss-120b"

@@ -4,22 +4,43 @@ rag_engine.py — Shared RAG logic for hialt-recall.
 Extracted from query.py so both the CLI and the Streamlit UI
 can import the same pipeline without duplication.
 
-Field names match MongoDB documents written by ingest.py:
-  source_file, headers, text, <embedding_field>
+Datastore: Postgres + pgvector (migrated 2026-09 from MongoDB — brute-force
+numpy cosine similarity replaced by a server-side pgvector HNSW index).
+Column names written by rag_consumer.py / read here:
+  source_file, headers, text, project_dir, project_name, tags, embedding
 """
 
 from __future__ import annotations
 
+import logging
 import os
+import re
 from pathlib import Path
 from dotenv import load_dotenv
 from dataclasses import dataclass
-from pathlib import Path
 from typing import List, Optional, TypedDict
 
-import numpy as np
+import psycopg2
 import requests
-from pymongo import MongoClient
+from pgvector import Vector
+from pgvector.psycopg2 import register_vector
+
+log = logging.getLogger("hialt.rag_engine")
+
+# Postgres identifiers (table names) come from environment variables the user
+# controls, but are still interpolated into SQL via f-strings below (psycopg2
+# can't parameterize identifiers) — validate them so a typo'd .env value fails
+# loudly at startup instead of producing confusing SQL syntax errors.
+_VALID_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _validate_identifier(name: str, label: str) -> str:
+    if not _VALID_IDENTIFIER_RE.match(name):
+        raise RuntimeError(
+            f"Invalid {label} '{name}' — must be a plain SQL identifier "
+            f"(letters, digits, underscore, not starting with a digit)."
+        )
+    return name
 
 
 # ---------------------------------------------------------------------------
@@ -28,12 +49,12 @@ from pymongo import MongoClient
 
 @dataclass(frozen=True)
 class Settings:
-    mongo_uri: str
-    mongo_default_db: str
-    mongo_collection: str
+    postgres_uri: str
+    postgres_table: str
+    postgres_failed_table: str
+    embedding_dim: int
     ollama_base_url: str
     embedding_model: str
-    embedding_field: str
     ollama_llm_model: str
     groq_api_key: Optional[str]
     groq_model: str
@@ -45,22 +66,22 @@ def load_settings(env_path: Optional[str] = None) -> Settings:
     """
     Load settings from .env then environment variables.
     Looks for .env in the parent directory (root) since this file lives in src/.
-    Raises RuntimeError if MONGO_URI is missing.
+    Raises RuntimeError if POSTGRES_URI is missing.
     """
     if env_path:
-        load_dotenv(dotenv_path=env_path, override=True)
+        dotenv_path = env_path
     else:
         this_dir = Path(__file__).resolve().parent
         root_dir = this_dir.parent
         dotenv_path = root_dir / ".env"
         if not dotenv_path.exists():
             dotenv_path = this_dir / ".env"
-            
-        load_dotenv(dotenv_path=dotenv_path, override=True)
 
-    mongo_uri = os.environ.get("MONGO_URI", "").strip()
-    if not mongo_uri:
-        raise RuntimeError(f"Missing MONGO_URI in .env or environment. Checked: {dotenv_path}")
+    load_dotenv(dotenv_path=dotenv_path, override=True)
+
+    postgres_uri = os.environ.get("POSTGRES_URI", "").strip()
+    if not postgres_uri:
+        raise RuntimeError(f"Missing POSTGRES_URI in .env or environment. Checked: {dotenv_path}")
 
     # Dynamically locate data/repos directory based on environment
     if os.environ.get("KUBERNETES_SERVICE_HOST"):
@@ -70,18 +91,133 @@ def load_settings(env_path: Optional[str] = None) -> Settings:
         data_repos_dir = (this_dir.parent / "data" / "repos").resolve()
 
     return Settings(
-        mongo_uri=mongo_uri,
-        mongo_default_db=os.environ.get("MONGO_DB_NAME", "local_rag").strip(),
-        mongo_collection=os.environ.get("MONGO_COLLECTION", "rag_chunks").strip(),
+        postgres_uri=postgres_uri,
+        postgres_table=_validate_identifier(
+            os.environ.get("POSTGRES_TABLE", "chunks").strip(), "POSTGRES_TABLE"
+        ),
+        postgres_failed_table=_validate_identifier(
+            os.environ.get("POSTGRES_FAILED_TABLE", "chunks_failed").strip(), "POSTGRES_FAILED_TABLE"
+        ),
+        embedding_dim=int(os.environ.get("EMBEDDING_DIM", "1024").strip()),
         ollama_base_url=os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434").strip(),
         embedding_model=os.environ.get("OLLAMA_EMBEDDING_MODEL", "mxbai-embed-large").strip(),
-        embedding_field=os.environ.get("MONGO_EMBEDDING_FIELD", "embedding").strip(),
         ollama_llm_model=os.environ.get("OLLAMA_LLM_MODEL", "llama3").strip(),
         groq_api_key=os.environ.get("GROQ_API_KEY") or None,
-        groq_model=os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile").strip(),
+        groq_model=os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b").strip(),
         llm_temperature=float(os.environ.get("LLM_TEMPERATURE", "0.2").strip()),
         data_repos_dir=data_repos_dir,  # Passed back here
     )
+
+
+# ---------------------------------------------------------------------------
+# Postgres connection + schema
+# ---------------------------------------------------------------------------
+
+def get_connection(settings: Settings, *, autocommit: bool = False):
+    """
+    Open a psycopg2 connection with pgvector's type adapters registered, so
+    a Vector() can be bound to a `vector` column/parameter and a `vector`
+    result column casts back to a Python object.
+
+    register_vector() looks the `vector` type up in the database and raises
+    psycopg2.ProgrammingError if the extension isn't installed — so this is
+    deliberately NOT used by ensure_schema(), which is the code path that
+    installs it. See _connect_raw().
+
+    Note that registration only adapts pgvector's own Vector (and numpy
+    ndarray); a plain list of floats binds as a Postgres ARRAY[...] literal,
+    which no `vector` operator accepts. Always wrap embeddings in Vector().
+    """
+    conn = _connect_raw(settings)
+    # register_vector() executes a type lookup. Set autocommit first when a
+    # caller needs it; psycopg2 refuses to change the setting after that lookup
+    # has opened a transaction.
+    conn.autocommit = autocommit
+    register_vector(conn)
+    return conn
+
+
+def _connect_raw(settings: Settings):
+    """Open a connection without pgvector registration (bootstrap path)."""
+    return psycopg2.connect(settings.postgres_uri)
+
+
+def ensure_schema(settings: Settings) -> None:
+    """
+    Create the pgvector extension, the chunks table + its indexes, and the
+    dead-letter table if they don't already exist yet. Idempotent — safe to
+    call on every startup, same philosophy as the old Mongo _ensure_indexes().
+
+    Called by rag_consumer.py at startup and by ingest.py's --reset path.
+
+    Uses _connect_raw() rather than get_connection(): the `vector` type may
+    not exist yet on a fresh database, and registering it is exactly what
+    would fail before the CREATE EXTENSION below has had a chance to run.
+
+    CREATE EXTENSION IF NOT EXISTS is a no-op when the extension is already
+    present, which is the normal case here — the platform provisions it
+    declaratively (the Database resource in hialt-platform requests it),
+    because pgvector is not a trusted extension and the owning role cannot
+    install it itself.
+    """
+    conn = _connect_raw(settings)
+    try:
+        conn.autocommit = True
+        with conn.cursor() as cur:
+            cur.execute("CREATE EXTENSION IF NOT EXISTS vector;")
+            cur.execute(f"""
+                CREATE TABLE IF NOT EXISTS {settings.postgres_table} (
+                    doc_id       TEXT PRIMARY KEY,
+                    project_dir  TEXT NOT NULL,
+                    project_name TEXT NOT NULL,
+                    tags         TEXT[] NOT NULL DEFAULT '{{}}',
+                    source_file  TEXT NOT NULL,
+                    chunk_index  INT NOT NULL,
+                    headers      TEXT,
+                    text         TEXT NOT NULL,
+                    embedding    vector({settings.embedding_dim}),
+                    updated_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+                );
+            """)
+            cur.execute(f"""
+                CREATE INDEX IF NOT EXISTS idx_{settings.postgres_table}_project_dir
+                    ON {settings.postgres_table} (project_dir);
+            """)
+            cur.execute(f"""
+                CREATE INDEX IF NOT EXISTS idx_{settings.postgres_table}_project_name
+                    ON {settings.postgres_table} (project_name);
+            """)
+            cur.execute(f"""
+                CREATE INDEX IF NOT EXISTS idx_{settings.postgres_table}_tags
+                    ON {settings.postgres_table} USING GIN (tags);
+            """)
+            # HNSW + cosine distance ops — matches the old numpy cosine-similarity
+            # ranking exactly (score = 1 - cosine_distance, see fetch_and_rank).
+            cur.execute(f"""
+                CREATE INDEX IF NOT EXISTS idx_{settings.postgres_table}_embedding_hnsw
+                    ON {settings.postgres_table} USING hnsw (embedding vector_cosine_ops);
+            """)
+            cur.execute(f"""
+                CREATE TABLE IF NOT EXISTS {settings.postgres_failed_table} (
+                    doc_id       TEXT PRIMARY KEY,
+                    project_dir  TEXT,
+                    project_name TEXT,
+                    tags         TEXT[],
+                    source_file  TEXT,
+                    chunk_index  INT,
+                    headers      TEXT,
+                    text         TEXT,
+                    error        TEXT,
+                    failed_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+                );
+            """)
+    finally:
+        conn.close()
+    log.info(
+        "Postgres schema verified (table=%s, failed_table=%s, embedding_dim=%d).",
+        settings.postgres_table, settings.postgres_failed_table, settings.embedding_dim,
+    )
+
 
 # ---------------------------------------------------------------------------
 # Data types
@@ -92,8 +228,8 @@ class Chunk(TypedDict):
     source_file: str
     headers: str
     score: float
-    # Populated when the document carries a metadata block (manifest-ingested)
-    metadata: dict          # {"project": str, "tags": list[str]}
+    # {"project": <manifest display name>, "tags": [...]}
+    metadata: dict
 
 
 @dataclass
@@ -110,7 +246,7 @@ class RAGResult:
 # ---------------------------------------------------------------------------
 
 def embed_query(settings: Settings, text: str) -> List[float]:
-    """Embed text via Ollama. Matches _ollama_embeddings() in query.py."""
+    """Embed text via Ollama. Matches _embed() in rag_consumer.py."""
     url = f"{settings.ollama_base_url.rstrip('/')}/api/embeddings"
     resp = requests.post(
         url,
@@ -125,50 +261,6 @@ def embed_query(settings: Settings, text: str) -> List[float]:
 # Retrieval
 # ---------------------------------------------------------------------------
 
-def _cosine_top_k(
-    query_vec: List[float],
-    docs: List[dict],
-    embedding_field: str,
-    top_k: int,
-) -> List[Chunk]:
-    """Exact port of _cosine_top_k() from query.py, extended to carry metadata."""
-    q = np.array(query_vec, dtype=np.float32)
-    q_norm = np.linalg.norm(q)
-    if q_norm == 0:
-        return []
-    q = q / q_norm
-
-    scored: List[Chunk] = []
-    for doc in docs:
-        raw_emb = doc.get(embedding_field)
-        if not raw_emb:
-            continue
-        v = np.array(raw_emb, dtype=np.float32)
-        v_norm = np.linalg.norm(v)
-        if v_norm == 0:
-            continue
-        score = float(np.dot(q, v / v_norm))
-        scored.append(
-            Chunk(
-                text=doc.get("text", ""),
-                source_file=doc.get("source_file", ""),
-                headers=doc.get("headers", ""),
-                score=score,
-                # Forward the nested metadata block written by ingest.py.
-                # Falls back to a dict built from the legacy flat "project"
-                # field so that documents ingested before this upgrade still
-                # surface meaningful metadata in the UI.
-                metadata=doc.get("metadata") or {
-                    "project": doc.get("project", ""),
-                    "tags":    [],
-                },
-            )
-        )
-
-    scored.sort(key=lambda c: c["score"], reverse=True)
-    return scored[:top_k]
-
-
 def fetch_and_rank(
     settings: Settings,
     query_vec: List[float],
@@ -177,84 +269,75 @@ def fetch_and_rank(
     tag_filter: Optional[str] = None,
 ) -> List[Chunk]:
     """
-    Fetch candidate documents from MongoDB, apply optional metadata filters,
-    then return the top-k chunks ranked by exact cosine similarity.
+    Retrieve the top-k chunks ranked by cosine similarity, computed and
+    ordered server-side via pgvector's HNSW index (`embedding <=> query`),
+    with optional project/tag filters pushed into the WHERE clause.
 
     Parameters
     ──────────
     settings
-        Shared pipeline configuration (Mongo URI, collection, embedding field).
+        Shared pipeline configuration (Postgres URI, table, embedding dim).
     query_vec
-        Embedding of the user's query; must match the dimensionality of stored
-        vectors (produced by ``embed_query()``).
+        Embedding of the user's query; must match settings.embedding_dim
+        (produced by ``embed_query()``).
     top_k
         Maximum number of ranked Chunk results to return.
     project_filter : optional
-        If provided, restricts the MongoDB query to documents where
-        ``metadata.project`` exactly equals this string.  Falls back to the
-        legacy top-level ``project`` field via ``$or`` so that documents
-        ingested before the manifest upgrade are still reachable.
+        If provided, matches EITHER project_dir (the raw directory name
+        under data/repos, e.g. "kubeconfigs" — what ingest.py's --project
+        flag uses) OR project_name (the manifest's display name, e.g.
+        "KubeConfigs") — these can legitimately differ.
     tag_filter : optional
-        If provided, restricts the MongoDB query to documents where
-        ``metadata.tags`` contains this tag (``$in`` semantics on the array).
+        If provided, restricts to rows whose tags array contains this tag.
 
     Returns
     ───────
     List[Chunk] — ranked highest-score-first, length ≤ top_k.
-    Empty list when no candidates match the filter or no embeddings are stored.
+    Empty list when no candidates match the filter or the table is empty.
     """
-    client = MongoClient(settings.mongo_uri, serverSelectionTimeoutMS=5000)
-    db     = client[settings.mongo_default_db]
-    collection = db[settings.mongo_collection]
-
-    # ── Build the metadata filter dynamically ─────────────────────────────
-    #
-    # Documents written by the updated ingest.py carry:
-    #   { "project": "dir-name",               # legacy flat field (kept)
-    #     "metadata": { "project": "Display Name", "tags": [...] } }
-    #
-    # To stay backwards-compatible with documents ingested before the manifest
-    # upgrade, project_filter matches EITHER location via $or.
-    # tag_filter targets only the new metadata.tags array.
-
-    filter_clauses: list[dict] = []
+    where_clauses: List[str] = []
+    # Vector(), not a plain list — psycopg2 renders a list as ARRAY[...],
+    # which the `<=>` operator has no overload for.
+    params: dict = {"query_vec": Vector(query_vec), "top_k": top_k}
 
     if project_filter is not None:
-        filter_clauses.append({
-            "$or": [
-                {"metadata.project": project_filter},
-                {"project":          project_filter},   # legacy flat field
-            ]
-        })
+        where_clauses.append("(project_dir = %(project_filter)s OR project_name = %(project_filter)s)")
+        params["project_filter"] = project_filter
 
     if tag_filter is not None:
-        # $in on an array field returns any doc whose tags list contains the value.
-        filter_clauses.append({"metadata.tags": {"$in": [tag_filter]}})
+        where_clauses.append("%(tag_filter)s = ANY(tags)")
+        params["tag_filter"] = tag_filter
 
-    match filter_clauses:
-        case []:
-            mongo_filter: dict = {}
-        case [single]:
-            mongo_filter = single
-        case multiple:
-            mongo_filter = {"$and": multiple}
+    where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
 
-    # ── Projection ────────────────────────────────────────────────────────
-    # Fetch exactly the fields _cosine_top_k + callers need.
-    # The embedding vector is included for scoring and stripped by _cosine_top_k
-    # before results are returned so it never leaks into the UI or prompt.
-    projection = {
-        "_id":              0,
-        "text":             1,
-        "source_file":      1,
-        "headers":          1,
-        "metadata":         1,
-        "project":          1,   # legacy field — for backwards-compat fallback in _cosine_top_k
-        settings.embedding_field: 1,
-    }
+    conn = get_connection(settings)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT source_file, headers, text, project_name, tags,
+                       1 - (embedding <=> %(query_vec)s) AS score
+                FROM {settings.postgres_table}
+                {where_sql}
+                ORDER BY embedding <=> %(query_vec)s
+                LIMIT %(top_k)s;
+                """,
+                params,
+            )
+            rows = cur.fetchall()
+    finally:
+        conn.close()
 
-    all_docs = list(collection.find(mongo_filter, projection))
-    return _cosine_top_k(query_vec, all_docs, settings.embedding_field, top_k)
+    return [
+        Chunk(
+            text=text,
+            source_file=source_file,
+            headers=headers or "",
+            score=float(score),
+            metadata={"project": project_name, "tags": list(tags) if tags else []},
+        )
+        for source_file, headers, text, project_name, tags, score in rows
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -372,7 +455,7 @@ def run_query(
     except Exception as e:
         return RAGResult(
             question=question, answer="", chunks=[], llm_used="none",
-            error=f"MongoDB retrieval failed: {e}",
+            error=f"Postgres retrieval failed: {e}",
         )
 
     if not chunks:
