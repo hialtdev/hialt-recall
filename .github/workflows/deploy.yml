@@ -56,7 +56,7 @@ jobs:
           username: ${{ secrets.K3S_USER }}
           key: ${{ secrets.K3S_SSH_KEY }}
           script: |
-            kubectl rollout restart deployment/hialt-recall-ui -n hialt-recall
-            kubectl rollout restart deployment/hialt-recall-consumer -n hialt-recall
+            kubectl set image deployment/hialt-recall-ui ui=${{ env.IMAGE_NAME }}:latest -n hialt-recall
+            kubectl set image deployment/hialt-recall-consumer consumer=${{ env.IMAGE_NAME }}:latest -n hialt-recall
             kubectl rollout status deployment/hialt-recall-ui -n hialt-recall --timeout=120s
             kubectl rollout status deployment/hialt-recall-consumer -n hialt-recall --timeout=120s

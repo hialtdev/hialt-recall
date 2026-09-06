@@ -19,7 +19,7 @@ spec:
         - name: ghcr-secret
       containers:
         - name: ui
-          image: ghcr.io/hialtdev/hialt-recall:postgres-pgvector-20260905
+          image: ghcr.io/hialtdev/hialt-recall:latest
           imagePullPolicy: Always
           ports:
             - containerPort: 8501
@@ -83,7 +83,7 @@ spec:
         - name: ghcr-secret
       containers:
         - name: consumer
-          image: ghcr.io/hialtdev/hialt-recall:postgres-pgvector-20260905
+          image: ghcr.io/hialtdev/hialt-recall:latest
           imagePullPolicy: Always
           command: ["python", "src/rag_consumer.py"]
           envFrom:
