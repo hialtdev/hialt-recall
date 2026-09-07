@@ -1,5 +1,7 @@
 # hialt-recall
 
+For hosted environments, release ownership, Cloudflare Access login, and operational checks, see the [stable/dev deployment runbook](DEPLOYMENT.md).
+
 A local-first RAG (Retrieval-Augmented Generation) pipeline for the hialt.dev home lab. Ask natural language questions about your own codebases and get cited answers grounded in your actual source files.
 
 **No special MongoDB plugins or `mongot` required.** Embeddings are stored as plain arrays; similarity search is done entirely in-process with numpy cosine similarity.
