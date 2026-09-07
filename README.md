@@ -1,5 +1,7 @@
 # hialt-recall
 
+For hosted environments, release ownership, Cloudflare Access login, and operational checks, see the [stable/dev deployment runbook](DEPLOYMENT.md).
+
 A local-first RAG (Retrieval-Augmented Generation) pipeline for the hialt.dev home lab. Ask natural language questions about your own codebases and get cited answers grounded in your actual source files.
 
 **Storage is PostgreSQL + pgvector**, on the shared `postgres-main` instance the platform runs in the `database` namespace. Embeddings live in a `vector(1024)` column and similarity search runs server-side against an HNSW index, so retrieval no longer scans every stored chunk. Migrated from MongoDB in September 2026.
